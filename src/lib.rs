@@ -21,7 +21,7 @@
 //! См. authoritative design в
 //! `/src/tasks/tolki-server/.artifacts/research/NERW-RPC-DESIGN.md`.
 
-#![doc(html_root_url = "https://docs.rs/nerw-rpc/0.1.0")]
+#![doc(html_root_url = "https://docs.rs/nerw-rpc/0.2.0")]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
 pub mod client;
