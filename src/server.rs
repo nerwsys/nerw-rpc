@@ -6,8 +6,8 @@
 //!
 //! 1. Peer opens а bidi substream к our [`iroh::Endpoint`] negotiated с
 //!    `tolki/wire-protocol/2.0.0`.
-//! 2. nerw-core's accept loop dispatches the connection к
-//!    [`WireDispatchHandler`] via the [`AlpnHandler`] trait.
+//! 2. nerw-core's accept loop dispatches the connection к the internal
+//!    wire-dispatch handler via the [`AlpnHandler`] trait.
 //! 3. The handler spawns а per-connection task that pumps `accept_bi()`
 //!    в а loop. Each accepted bidi stream becomes а fresh
 //!    request-handling task.
