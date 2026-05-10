@@ -1,54 +1,80 @@
-//! Datagram dispatch table — 256 token slots для voice / unreliable subprotocols.
+//! Datagram dispatch table — stream-id keyed map for voice / unreliable subprotocols.
 //!
 //! ## Voice flow (per `NERW-RPC-DESIGN.md` Section 5)
 //!
-//! 1. Handshake stream allocates а token (е.g. 42) для а concrete
-//!    method-name (tolki:voice@1.0.0/voice/start-voice-message) via the
-//!    normal [`crate::server::RpcServer`] flow. The handshake response
-//!    carries the allocated token byte.
-//! 2. Subsequent RTP frames are sent via
-//!    [`nerw_core::client::Client::send_datagram`] с the token prepended:
-//!    `[token=42 | postcard(rtp-frame)]`. The 1-byte token IS the
-//!    application-level routing prefix — distinct from nerw-core's
-//!    8-byte BLAKE3 envelope, which routes between agents.
-//! 3. The receiver's [`DatagramDispatcher::dispatch`] reads the leading
-//!    byte and forwards к the [`DatagramHandler`] registered at that
-//!    slot. Slots без registered handlers drop с
-//!    [`RpcError::DatagramTokenUnknown`].
+//! The dispatcher implements **WebTransport-style datagram correlation**
+//! (RFC 9221 + CONNECT-UDP / WebTransport). Каждый datagram carries а
+//! `varint(stream-id)` prefix identifying the bidi handshake stream
+//! that established the unreliable session. The dispatcher routes
+//! incoming datagrams к the [`DatagramHandler`] registered against
+//! that handshake stream-id.
 //!
-//! ## 256 slots, indexed by token byte
+//! 1. Application opens а bidi handshake stream (e.g. via
+//!    [`crate::client::RpcClient`]) к negotiate а voice session под
+//!    method-name `tolki:voice@1.0.0/voice/start-voice-message`. Client
+//!    knows the resulting QUIC stream-id (`SendStream::id().0`); server
+//!    sees the matching id on the accepted bidi.
+//! 2. Application code registers а [`DatagramHandler`] на the dispatcher
+//!    keyed by that stream-id via [`DatagramDispatcher::register`].
+//! 3. Subsequent RTP frames are sent via
+//!    [`nerw_core::client::Client::send_datagram`] с а `varint(stream-id)`
+//!    prefix instead of the legacy 1-byte token. The varint is decoded
+//!    by [`DatagramDispatcher::dispatch`] using
+//!    [`crate::wire::decode_stream_id`]; the trailing bytes are handed
+//!    к the registered handler.
+//! 4. Datagrams arriving for an unregistered stream-id surface as
+//!    [`crate::error::RpcError::DatagramStreamIdUnknown`] (visible on
+//!    the broadcast loop's dispatch result).
 //!
-//! Phase 2 ships а `[Option<Arc<dyn DatagramHandler>>; 256]` array
-//! protected by а `parking_lot::Mutex`. Lookup is O(1); registration /
-//! unregistration is rare. Slots are ALL `None` at startup; the
-//! application registers handlers as it negotiates new sub-protocol
-//! sessions.
+//! ## Why stream-id (not а 1-byte token)
 //!
-//! ## Why `parking_lot::Mutex` (not tokio's)
+//! Phase 2's first cut (ALPN `tolki/datagram/1.0.0`) keyed the
+//! dispatcher on а 1-byte token allocated by the handshake response.
+//! Two problems с that:
 //!
-//! The lock window is microscopic (single index + `Arc::clone`) и we
-//! never `.await` while holding it. `parking_lot::Mutex` is а раз
-//! cheaper than `tokio::sync::Mutex` for that workload и does not
-//! require `async` к acquire.
+//! 1. **256-session cap per connection.** А peer could establish at
+//!    most 256 concurrent unreliable subprotocol sessions before token
+//!    space exhaustion forced reuse / collision handling. WebTransport
+//!    works the same way for the same reason: it uses а varint, not а
+//!    bounded enum.
+//! 2. **No correlation к the establishing stream.** Token allocation
+//!    happened over а handshake bidi, but the token itself bore no
+//!    relationship к the stream's id — making cross-debugger
+//!    investigation hard ("which stream owns token 42?").
+//!
+//! Stream-id keying solves both: the dispatcher's key IS the QUIC
+//! stream-id of the handshake stream that established the session,
+//! making correlation explicit и unbounded.
+//!
+//! ## `DashMap` (not а `parking_lot::Mutex<HashMap>`)
+//!
+//! The dispatcher uses [`dashmap::DashMap`] для concurrent O(1) lookup
+//! без а global lock. `DashMap` shards internally по hash, so concurrent
+//! `register` / `unregister` / `dispatch` calls touching different
+//! stream-ids do not contend. We never `.await` while holding а
+//! `DashMap` shard guard — the dispatch path clones the `Arc<dyn Handler>`
+//! и drops the guard before invoking the handler's `.await`-able body.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use parking_lot::Mutex;
+use dashmap::DashMap;
 use tracing::trace;
 
 use crate::context::{PeerMetadata, RpcContext, TimingInfo, TracingInfo};
 use crate::error::{RpcError, RpcResult};
 use crate::transport::ALPN_TOLKI_DATAGRAM_2_0_0;
+use crate::wire::decode_stream_id;
 
-/// Handler trait for datagram tokens — application code implements
-/// this once per registered sub-protocol slot.
+/// Handler trait for datagram sessions — application code implements
+/// this once per registered handshake stream-id.
 ///
 /// The dispatcher hands the handler the per-frame [`RpcContext`] и the
-/// payload bytes (everything после the leading token byte). Handlers
-/// MUST return promptly — the dispatcher's caller drives the inbound
-/// datagram broadcast loop, и slow handlers can starve other tokens.
+/// payload bytes (everything после the leading `varint(stream-id)`
+/// prefix). Handlers MUST return promptly — the dispatcher's caller
+/// drives the inbound datagram broadcast loop, и slow handlers can
+/// starve other sessions sharing the same connection.
 ///
 /// `payload` is а [`Bytes`] view sharing the same underlying allocation
 /// as the inbound datagram — handlers can clone it cheaply (ref-count
@@ -65,32 +91,20 @@ pub trait DatagramHandler: Send + Sync + 'static {
     async fn handle(&self, ctx: RpcContext, payload: Bytes) -> RpcResult<()>;
 }
 
-/// Number of token slots — one per possible byte value (`0..=255`).
-const SLOT_COUNT: usize = 256;
-
-/// One slot per token byte — boxed array so the `Mutex` value is а
-/// pointer-sized handle rather than 256 `Option<Arc<...>>` (≈4 KiB
-/// inline on 64-bit). `[None; 256]` cannot be used because
-/// `Option<Arc<dyn ...>>` is not `Copy`; `array::from_fn` initialises
-/// each slot к `None` без а `Copy` bound.
-type SlotArray = Box<[Option<Arc<dyn DatagramHandler>>; SLOT_COUNT]>;
-
-/// 256-slot dispatch table keyed on the leading datagram byte.
+/// Stream-id keyed dispatch table for inbound datagrams.
 ///
-/// The slots array sits behind а `parking_lot::Mutex` because:
+/// Each entry maps а handshake bidi stream-id (`u64`, allocated by
+/// QUIC) к the [`DatagramHandler`] registered for that session.
+/// Lookup is O(1) via [`dashmap::DashMap`]; mutations и reads do not
+/// contend on а global lock.
 ///
-/// - Mutating registrations would need а write lock anyway (`RwLock`
-///   would not buy us anything for the mutation path).
-/// - The read path holds the lock for а handful of nanoseconds (а
-///   single index + `Arc::clone`); contention с а concurrent
-///   `register()` is so unlikely it does not justify the `RwLock`'s
-///   extra atomics.
-///
-/// `Default` impl is hand-rolled because `[None; 256]` requires `Copy`
-/// и `Option<Arc<dyn ...>>` is not `Copy`.
+/// Capacity is unbounded (limited only by the operating system / heap)
+/// — there is no equivalent of the 1.0.0 ALPN's 256-slot cap.
 pub struct DatagramDispatcher {
-    /// One slot per possible token byte. `None` = unregistered.
-    slots: Mutex<SlotArray>,
+    /// Map handshake stream-id → handler. Keyed by the `u64`
+    /// stream-id of the bidi handshake stream that established the
+    /// datagram session.
+    handlers: DashMap<u64, Arc<dyn DatagramHandler>>,
 }
 
 impl Default for DatagramDispatcher {
@@ -101,14 +115,8 @@ impl Default for DatagramDispatcher {
 
 impl std::fmt::Debug for DatagramDispatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let registered = self
-            .slots
-            .lock()
-            .iter()
-            .filter(|slot| slot.is_some())
-            .count();
         f.debug_struct("DatagramDispatcher")
-            .field("registered_slots", &registered)
+            .field("registered_count", &self.handlers.len())
             .finish_non_exhaustive()
     }
 }
@@ -117,74 +125,109 @@ impl DatagramDispatcher {
     /// Build an empty dispatcher.
     #[must_use]
     pub fn new() -> Self {
-        // `array::from_fn` initialises each slot к `None` без requiring
-        // `Copy` (which `Option<Arc<dyn DatagramHandler>>` lacks).
-        let slots: [Option<Arc<dyn DatagramHandler>>; SLOT_COUNT] = std::array::from_fn(|_| None);
         Self {
-            slots: Mutex::new(Box::new(slots)),
+            handlers: DashMap::new(),
         }
     }
 
-    /// Register а handler at the given token slot.
+    /// Register а handler keyed by handshake stream-id.
+    ///
+    /// The `stream_id` is the `u64` identifier of the bidi handshake
+    /// stream that established the datagram session. Server-side
+    /// callers obtain it from the accepted bidi
+    /// (`SendStream::id().0` / `RecvStream::id().0`); client-side
+    /// callers from the `open_bi` return value.
     ///
     /// # Errors
     ///
-    /// Returns [`RpcError::DatagramTokenCollision`] if the slot is
-    /// already occupied. Use [`Self::unregister`] first if you need
-    /// к replace.
-    pub fn register(&self, token: u8, handler: Arc<dyn DatagramHandler>) -> RpcResult<()> {
-        let mut slots = self.slots.lock();
-        let idx = usize::from(token);
-        if slots[idx].is_some() {
-            return Err(RpcError::DatagramTokenCollision { token });
+    /// Returns [`RpcError::DatagramStreamIdCollision`] if а handler is
+    /// already registered for the same stream-id. Use
+    /// [`Self::unregister`] first if you need к replace.
+    pub fn register(
+        &self,
+        stream_id: u64,
+        handler: Arc<dyn DatagramHandler>,
+    ) -> RpcResult<()> {
+        // DashMap::entry returns either Vacant or Occupied. Using `entry`
+        // ensures the check-and-insert is atomic against concurrent
+        // registrations on the same shard.
+        match self.handlers.entry(stream_id) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                Err(RpcError::DatagramStreamIdCollision { stream_id })
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(handler);
+                trace!(stream_id, "datagram handler registered");
+                Ok(())
+            }
         }
-        slots[idx] = Some(handler);
-        trace!(token, "datagram handler registered");
-        Ok(())
     }
 
-    /// Remove the handler at the given token slot. Idempotent.
+    /// Drop the handler registered под the given stream-id. Idempotent
+    /// — calling on an unregistered stream-id is а silent no-op
+    /// (returns `None`).
     ///
     /// Returns the previous handler if one was registered.
-    pub fn unregister(&self, token: u8) -> Option<Arc<dyn DatagramHandler>> {
-        let mut slots = self.slots.lock();
-        slots[usize::from(token)].take()
+    #[must_use]
+    pub fn unregister(&self, stream_id: u64) -> Option<Arc<dyn DatagramHandler>> {
+        self.handlers.remove(&stream_id).map(|(_, h)| h)
     }
 
     /// Number of currently-registered handlers (test introspection).
     #[must_use]
     pub fn registered_count(&self) -> usize {
-        self.slots.lock().iter().filter(|s| s.is_some()).count()
+        self.handlers.len()
     }
 
-    /// Dispatch one inbound datagram frame: `[token | payload]`.
+    /// Dispatch one inbound datagram frame:
+    /// `[varint(stream-id) | payload]`.
     ///
     /// `frame` is taken as а [`Bytes`] so the payload slice handed к
     /// the handler shares the inbound allocation (zero-copy split-off
-    /// of the leading token byte).
+    /// of the varint prefix).
     ///
     /// # Errors
     ///
-    /// - [`RpcError::DatagramTooShort`] — `frame.is_empty()` (no token byte).
-    /// - [`RpcError::DatagramTokenUnknown`] — slot has no registered handler.
+    /// - [`RpcError::DatagramTooShort`] — varint cannot be decoded
+    ///   from the (truncated / empty) frame.
+    /// - [`RpcError::MalformedFrame`] — varint decoded but exceeds
+    ///   `u64` (delegated к [`crate::wire::decode_stream_id`]).
+    /// - [`RpcError::DatagramStreamIdUnknown`] — no handler registered
+    ///   for the decoded stream-id.
     /// - Any error returned by the handler itself.
     pub async fn dispatch(&self, ctx: RpcContext, frame: Bytes) -> RpcResult<()> {
-        let token = *frame
-            .first()
-            .ok_or(RpcError::DatagramTooShort { len: frame.len() })?;
-        let payload = frame.slice(1..);
+        // Empty frame cannot carry а varint at all — surface а
+        // dedicated DatagramTooShort variant with diagnostic length.
+        if frame.is_empty() {
+            return Err(RpcError::DatagramTooShort { len: 0 });
+        }
 
-        // Scoped lock — clone the Arc и drop the lock BEFORE awaiting
-        // the handler. Holding а sync mutex across .await is а foot-gun
-        // (deadlock with tokio runtimes that have один worker thread).
-        let handler = {
-            let slots = self.slots.lock();
-            slots[usize::from(token)].clone()
+        // Decode the varint prefix using the wire helper. Errors map
+        // through MalformedFrame for truncated / oversized varints.
+        let (stream_id, payload_slice) = match decode_stream_id(&frame) {
+            Ok(parsed) => parsed,
+            // Distinguish "buffer too short to even start а varint"
+            // (we already short-circuited empty above) from "varint
+            // structure invalid" — only the latter reaches here, so
+            // surface as MalformedFrame which is propagated unchanged.
+            Err(e) => return Err(e),
         };
+
+        // Compute the consumed varint length so we can split а Bytes
+        // view (zero-copy) instead of an &[u8] reference. payload_slice
+        // is а slice of frame; subtract its len from the original к
+        // get the prefix length.
+        let prefix_len = frame.len() - payload_slice.len();
+        let payload = frame.slice(prefix_len..);
+
+        // Lookup, clone Arc, drop the DashMap guard BEFORE awaiting
+        // the handler. Holding а sync guard across .await is а foot-gun
+        // (deadlock with tokio runtimes that have один worker thread).
+        let handler = self.handlers.get(&stream_id).map(|entry| Arc::clone(&entry));
 
         match handler {
             Some(h) => h.handle(ctx, payload).await,
-            None => Err(RpcError::DatagramTokenUnknown { token }),
+            None => Err(RpcError::DatagramStreamIdUnknown { stream_id }),
         }
     }
 
@@ -223,6 +266,8 @@ impl DatagramDispatcher {
 mod tests {
     use super::*;
     use crate::context::{PeerMetadata, RpcContext, loopback_node_id};
+    use crate::wire::encode_stream_id;
+    use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CountingHandler {
@@ -256,6 +301,14 @@ mod tests {
         }
     }
 
+    /// Build а datagram frame from а stream-id и payload bytes.
+    fn build_frame(stream_id: u64, payload: &[u8]) -> Bytes {
+        let mut buf = Vec::new();
+        encode_stream_id(stream_id, &mut buf).expect("encode stream-id");
+        buf.extend_from_slice(payload);
+        Bytes::from(buf)
+    }
+
     #[test]
     fn new_dispatcher_has_zero_registered() {
         let d = DatagramDispatcher::new();
@@ -280,11 +333,30 @@ mod tests {
             .expect("first register");
         let err = d
             .register(7, Arc::new(CountingHandler::new()))
-            .expect_err("second register at same token must error");
+            .expect_err("second register at same stream-id must error");
         match err {
-            RpcError::DatagramTokenCollision { token } => assert_eq!(token, 7),
-            other => panic!("expected DatagramTokenCollision, got {other:?}"),
+            RpcError::DatagramStreamIdCollision { stream_id } => assert_eq!(stream_id, 7),
+            other => panic!("expected DatagramStreamIdCollision, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unregister_unknown_stream_id_is_idempotent() {
+        let d = DatagramDispatcher::new();
+        // Unregistering а never-registered id MUST NOT panic.
+        let prev = d.unregister(9999);
+        assert!(prev.is_none());
+    }
+
+    #[test]
+    fn register_supports_large_stream_ids() {
+        // Ensure stream-ids beyond the old 256-slot cap work cleanly.
+        let d = DatagramDispatcher::new();
+        d.register(1_000_000, Arc::new(CountingHandler::new()))
+            .expect("register large id");
+        d.register(u64::from(u32::MAX), Arc::new(CountingHandler::new()))
+            .expect("register near-max id");
+        assert_eq!(d.registered_count(), 2);
     }
 
     #[tokio::test]
@@ -296,13 +368,13 @@ mod tests {
         d.register(2, h_b.clone()).expect("register B");
 
         let ctx = RpcContext::minimal(PeerMetadata::loopback());
-        d.dispatch(ctx.clone(), Bytes::from_static(&[1, 0xAA, 0xBB]))
+        d.dispatch(ctx.clone(), build_frame(1, &[0xAA, 0xBB]))
             .await
             .expect("A");
-        d.dispatch(ctx.clone(), Bytes::from_static(&[2, 0xCC]))
+        d.dispatch(ctx.clone(), build_frame(2, &[0xCC]))
             .await
             .expect("B");
-        d.dispatch(ctx, Bytes::from_static(&[1, 0xDD, 0xEE, 0xFF]))
+        d.dispatch(ctx, build_frame(1, &[0xDD, 0xEE, 0xFF]))
             .await
             .expect("A");
 
@@ -313,16 +385,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_unknown_token_errors() {
+    async fn dispatch_unknown_stream_id_errors() {
         let d = DatagramDispatcher::new();
         let ctx = RpcContext::minimal(PeerMetadata::loopback());
         let err = d
-            .dispatch(ctx, Bytes::from_static(&[100, 0xAA]))
+            .dispatch(ctx, build_frame(100, &[0xAA]))
             .await
-            .expect_err("unknown token must error");
+            .expect_err("unknown stream-id must error");
         match err {
-            RpcError::DatagramTokenUnknown { token } => assert_eq!(token, 100),
-            other => panic!("expected DatagramTokenUnknown, got {other:?}"),
+            RpcError::DatagramStreamIdUnknown { stream_id } => assert_eq!(stream_id, 100),
+            other => panic!("expected DatagramStreamIdUnknown, got {other:?}"),
         }
     }
 
@@ -338,6 +410,22 @@ mod tests {
             RpcError::DatagramTooShort { len } => assert_eq!(len, 0),
             other => panic!("expected DatagramTooShort, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_decodes_large_stream_id() {
+        // Stream-ids в the upper varint range still route correctly.
+        let d = DatagramDispatcher::new();
+        let h = Arc::new(CountingHandler::new());
+        let big_id: u64 = 1_000_000_000;
+        d.register(big_id, h.clone()).expect("register");
+
+        let ctx = RpcContext::minimal(PeerMetadata::loopback());
+        d.dispatch(ctx, build_frame(big_id, b"BIG"))
+            .await
+            .expect("dispatch");
+        assert_eq!(h.call_count(), 1);
+        assert_eq!(h.last_payload(), b"BIG");
     }
 
     #[test]

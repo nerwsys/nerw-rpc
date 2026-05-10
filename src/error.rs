@@ -13,8 +13,8 @@
 //!   [`RpcError::TransportRegisterAlpn`], [`RpcError::TransportRead`],
 //!   [`RpcError::TransportWrite`]) — concrete iroh-specific failure modes
 //!   surfaced by [`crate::client::RpcClient`] / [`crate::server::RpcServer`].
-//! - **Datagram errors** ([`RpcError::DatagramTokenCollision`],
-//!   [`RpcError::DatagramTokenUnknown`], [`RpcError::DatagramTooShort`])
+//! - **Datagram errors** ([`RpcError::DatagramStreamIdCollision`],
+//!   [`RpcError::DatagramStreamIdUnknown`], [`RpcError::DatagramTooShort`])
 //!   — surface for [`crate::datagram::DatagramDispatcher`].
 
 use thiserror::Error;
@@ -92,22 +92,30 @@ pub enum RpcError {
     },
 
     /// Caller asked [`crate::datagram::DatagramDispatcher::register`] к
-    /// register а handler at а token slot already occupied.
-    #[error("datagram: token {token} already registered")]
-    DatagramTokenCollision {
-        /// The token slot that was already in use.
-        token: u8,
+    /// register а handler against а handshake stream-id that already
+    /// has one. Use [`crate::datagram::DatagramDispatcher::unregister`]
+    /// first к replace.
+    #[error("datagram: stream-id {stream_id} already registered")]
+    DatagramStreamIdCollision {
+        /// The handshake stream-id that was already в use.
+        stream_id: u64,
     },
 
-    /// Inbound datagram was dispatched к а token slot с no registered handler.
-    #[error("datagram: token {token} not registered")]
-    DatagramTokenUnknown {
-        /// The token byte read from the datagram prefix.
-        token: u8,
+    /// Inbound datagram targeted а handshake stream-id с no registered
+    /// handler. Either the application has not yet completed handshake
+    /// registration, or the peer is sending datagrams for а session
+    /// that was already closed (race during teardown).
+    #[error("datagram: stream-id {stream_id} not registered")]
+    DatagramStreamIdUnknown {
+        /// The handshake stream-id decoded from the varint prefix.
+        stream_id: u64,
     },
 
-    /// Inbound datagram was empty — there is no token byte к dispatch on.
-    #[error("datagram: too short ({len} bytes), need at least 1 byte for token")]
+    /// Inbound datagram was empty — there are no bytes к decode the
+    /// `varint(stream-id)` prefix from.
+    #[error(
+        "datagram: too short ({len} bytes), need at least 1 byte for varint stream-id prefix"
+    )]
     DatagramTooShort {
         /// Actual length of the malformed datagram.
         len: usize,
@@ -174,19 +182,29 @@ mod tests {
     }
 
     #[test]
-    fn datagram_token_collision_displays_token() {
-        let err = RpcError::DatagramTokenCollision { token: 42 };
+    fn datagram_stream_id_collision_displays_id() {
+        let err = RpcError::DatagramStreamIdCollision { stream_id: 42 };
         let s = err.to_string();
         assert!(s.contains("42"));
         assert!(s.contains("already registered"));
     }
 
     #[test]
-    fn datagram_token_unknown_displays_token() {
-        let err = RpcError::DatagramTokenUnknown { token: 7 };
+    fn datagram_stream_id_unknown_displays_id() {
+        let err = RpcError::DatagramStreamIdUnknown { stream_id: 7 };
         let s = err.to_string();
         assert!(s.contains('7'));
         assert!(s.contains("not registered"));
+    }
+
+    #[test]
+    fn datagram_stream_id_collision_supports_large_ids() {
+        // Verify u64 ids beyond the old 256-slot cap render correctly.
+        let err = RpcError::DatagramStreamIdCollision {
+            stream_id: 1_000_000,
+        };
+        let s = err.to_string();
+        assert!(s.contains("1000000"));
     }
 
     #[test]
