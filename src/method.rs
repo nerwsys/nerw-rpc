@@ -139,7 +139,7 @@ impl MethodRegistry {
     /// Panics if `canonical_name` is malformed or lacks `@version` —
     /// registered handlers must always pin a concrete version so version
     /// resolution at lookup time is unambiguous.
-    #[allow(clippy::panic, clippy::missing_panics_doc)]
+    #[allow(clippy::panic)]
     pub fn register(&mut self, canonical_name: &str, handler: Arc<dyn MethodHandler>) {
         let Some(parsed) = MethodName::parse(canonical_name) else {
             panic!("invalid method name: {canonical_name}");

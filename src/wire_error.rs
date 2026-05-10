@@ -162,7 +162,19 @@ impl WireError {
             },
             Self::InvalidMethodName { input } => RpcError::InvalidMethodName(input),
             Self::MalformedFrame { reason } => RpcError::MalformedFrame(reason),
-            Self::HandlerError { display } => RpcError::Handler(display.into()),
+            Self::HandlerError { display } => {
+                // Server-side `RpcError::Handler` Display prepends "handler error: "
+                // (see thiserror `#[error("handler error: {0}")]` on the variant).
+                // Once we re-wrap the wire string into а fresh `RpcError::Handler`
+                // here, the client-side Display would prepend "handler error: "
+                // again, producing "handler error: handler error: …". Strip the
+                // server-side prefix so the client renders а single prefix.
+                let inner = display
+                    .strip_prefix("handler error: ")
+                    .unwrap_or(&display)
+                    .to_string();
+                RpcError::Handler(inner.into())
+            }
             Self::Codec { display } => {
                 // postcard::Error is an opaque-shaped enum without а String
                 // constructor; the client surfaces the original display
@@ -321,6 +333,41 @@ mod tests {
             }
             other => panic!("expected HandlerError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn handler_error_no_doubled_prefix() {
+        // Reproduces the round-trip path: server constructs RpcError::Handler,
+        // converts к WireError using its Display rendering, ships it over the
+        // wire, client decodes and re-wraps. The final client-side Display
+        // must contain exactly one "handler error: " prefix — not two.
+        let server_err = RpcError::Handler("domain failure".into());
+        let wire_msg = server_err.to_string(); // "handler error: domain failure"
+        assert_eq!(wire_msg, "handler error: domain failure");
+
+        let wire_err = WireError::HandlerError { display: wire_msg };
+        let client_err = wire_err.into_rpc_error();
+        let client_display = client_err.to_string();
+
+        assert_eq!(
+            client_display.matches("handler error:").count(),
+            1,
+            "expected single prefix, got {client_display:?}"
+        );
+        assert_eq!(client_display, "handler error: domain failure");
+    }
+
+    #[test]
+    fn handler_error_preserves_payload_without_prefix() {
+        // If the server-side Display did NOT carry the "handler error: " prefix
+        // (е.g. some future variant collapsed into HandlerError), the client
+        // must preserve the payload verbatim — strip_prefix on absent prefix
+        // returns the input unchanged.
+        let wire_err = WireError::HandlerError {
+            display: "raw inner failure".to_string(),
+        };
+        let client_err = wire_err.into_rpc_error();
+        assert_eq!(client_err.to_string(), "handler error: raw inner failure");
     }
 
     #[test]

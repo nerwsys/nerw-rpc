@@ -415,11 +415,17 @@ fn build_inbound_context(
     )
     .unwrap_or(0);
 
-    // Monotonic time elapsed since process start — Tokio's runtime sets
-    // an early reference Instant; subtracting from `Instant::now()` would
-    // give us "ns since now", not "ns since process start". We use the
-    // accept_instant's elapsed nanos relative к the runtime epoch, which
-    // is what a Prometheus histogram cares about.
+    // Monotonic ns elapsed since the bidi stream был accepted (i.e.
+    // since `accept_instant` was sampled at the top of `handle_unary_stream`).
+    // This is **not** the same as `frame_decode_duration_us`:
+    //   - `frame_decode_duration_us` measures parse cost (microseconds
+    //     spent inside `decode_method_name` + opcode validation).
+    //   - `received_at_monotonic_ns` is а monotonic timestamp marker
+    //     useful as ordering key for events на the handler side
+    //     (e.g. correlating multiple metrics emitted within one request)
+    //     и as denominator for Prometheus histograms keyed off accept time.
+    // The two fields share the same epoch (`accept_instant`) but encode
+    // distinct quantities (duration vs timestamp).
     let received_at_monotonic_ns =
         u64::try_from(accept_instant.elapsed().as_nanos()).unwrap_or(u64::MAX);
 

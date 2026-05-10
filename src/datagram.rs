@@ -12,7 +12,7 @@
 //! 1. Application opens а bidi handshake stream (e.g. via
 //!    [`crate::client::RpcClient`]) к negotiate а voice session под
 //!    method-name `tolki:voice@1.0.0/voice/start-voice-message`. Client
-//!    knows the resulting QUIC stream-id (`SendStream::id().0`); server
+//!    knows the resulting QUIC stream-id (`u64::from(send.id())`); server
 //!    sees the matching id on the accepted bidi.
 //! 2. Application code registers а [`DatagramHandler`] на the dispatcher
 //!    keyed by that stream-id via [`DatagramDispatcher::register`].
@@ -135,8 +135,12 @@ impl DatagramDispatcher {
     /// The `stream_id` is the `u64` identifier of the bidi handshake
     /// stream that established the datagram session. Server-side
     /// callers obtain it from the accepted bidi
-    /// (`SendStream::id().0` / `RecvStream::id().0`); client-side
+    /// (`u64::from(send.id())` / `u64::from(recv.id())`); client-side
     /// callers from the `open_bi` return value.
+    ///
+    /// Note: `quinn_proto::StreamId` wraps `u64` in а tuple struct but
+    /// the inner field is not `pub` — use the `From<StreamId> for u64`
+    /// conversion (`u64::from(...)`) rather than `.id().0`.
     ///
     /// # Errors
     ///

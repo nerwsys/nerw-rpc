@@ -28,9 +28,16 @@ pub fn decode<T: for<'a> Deserialize<'a>>(bytes: &[u8]) -> RpcResult<T> {
     postcard::from_bytes(bytes).map_err(RpcError::from)
 }
 
-/// Encode a value into an existing buffer (zero-allocation hot-path helper).
+/// Encode а value and append the postcard bytes к an existing buffer.
 ///
-/// Appends the postcard-encoded bytes to `buf` in place.
+/// Useful for concatenation patterns (`[opcode | varint(name_len) | name | postcard(payload)]`)
+/// where the caller is already building а frame in а single owned `Vec<u8>`.
+///
+/// Note: this helper allocates an intermediate `Vec` через
+/// [`postcard::to_stdvec`] and copies it into `buf` via `extend_from_slice`.
+/// It is **not** zero-allocation. Если в будущем понадобится truly
+/// zero-alloc encode-into, switch к `postcard::serialize_with_flavor`
+/// using а `Vec<u8>`-backed flavor that writes in place.
 ///
 /// # Errors
 ///

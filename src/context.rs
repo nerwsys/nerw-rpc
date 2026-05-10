@@ -189,8 +189,15 @@ pub struct TimingInfo {
     /// Wall-clock ms since UNIX epoch when the frame finished decoding.
     pub received_at_ms: i64,
 
-    /// Monotonic ns since process start when the frame finished decoding.
-    /// Use this — not [`Self::received_at_ms`] — for latency measurements.
+    /// Monotonic ns since the bidi stream was accepted, sampled when the
+    /// frame finished decoding. Use this — not [`Self::received_at_ms`]
+    /// — for latency measurements (wall-clock can jump under NTP / DST).
+    ///
+    /// **Distinct from [`Self::frame_decode_duration_us`]**: this field
+    /// is а monotonic *timestamp marker* (useful as event-ordering key
+    /// or histogram baseline keyed off accept time);
+    /// [`Self::frame_decode_duration_us`] is the *duration* spent
+    /// parsing the frame.
     pub received_at_monotonic_ns: u64,
 
     /// Hot-path profiling — microseconds spent decoding the inbound frame
