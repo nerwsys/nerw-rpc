@@ -35,13 +35,13 @@ pub mod transport;
 pub mod wire;
 
 // Re-exports для конвенции
+pub use crate::client::RpcClient;
 pub use crate::context::{
     AuthenticatedContext, NodeId, PeerMetadata, RpcContext, SessionInfo, TimingInfo, TracingInfo,
     loopback_node_id,
 };
-pub use crate::error::{RpcError, RpcResult};
-pub use crate::client::RpcClient;
 pub use crate::datagram::{DatagramDispatcher, DatagramHandler};
+pub use crate::error::{RpcError, RpcResult};
 pub use crate::method::{MethodHandler, MethodName, MethodRegistry};
 pub use crate::server::RpcServer;
 pub use crate::transport::{

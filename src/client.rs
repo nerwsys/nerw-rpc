@@ -136,10 +136,7 @@ fn decode_response_frame(buf: &[u8]) -> RpcResult<Vec<u8>> {
             // simple string protocol; Phase 3+ will switch к а typed
             // postcard discriminant.
             if msg.starts_with("unknown method:") {
-                let name = msg
-                    .trim_start_matches("unknown method:")
-                    .trim()
-                    .to_string();
+                let name = msg.trim_start_matches("unknown method:").trim().to_string();
                 Err(RpcError::UnknownMethod(name))
             } else {
                 Err(RpcError::Handler(msg.into()))
@@ -182,10 +179,9 @@ mod tests {
     fn decode_response_frame_error_unknown_method() {
         let mut buf = Vec::new();
         buf.push(OPCODE_UNARY_ERROR);
-        let body = postcard::to_allocvec(
-            &"unknown method: tolki:nope@1.0.0/iface/method".to_string(),
-        )
-        .expect("encode");
+        let body =
+            postcard::to_allocvec(&"unknown method: tolki:nope@1.0.0/iface/method".to_string())
+                .expect("encode");
         buf.extend_from_slice(&body);
         let err = decode_response_frame(&buf).expect_err("must error");
         match err {
