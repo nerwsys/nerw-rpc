@@ -27,6 +27,7 @@
 pub mod client;
 pub mod codec;
 pub mod context;
+pub mod datagram;
 pub mod error;
 pub mod method;
 pub mod server;
@@ -40,6 +41,7 @@ pub use crate::context::{
 };
 pub use crate::error::{RpcError, RpcResult};
 pub use crate::client::RpcClient;
+pub use crate::datagram::{DatagramDispatcher, DatagramHandler};
 pub use crate::method::{MethodHandler, MethodName, MethodRegistry};
 pub use crate::server::RpcServer;
 pub use crate::transport::{
