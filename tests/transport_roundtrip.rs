@@ -40,7 +40,7 @@ use nerw_core::protocol::ALPN_NERW_RPC;
 use nerw_rpc::{
     ALPN_TOLKI_DATAGRAM_1_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, DatagramDispatcher, DatagramHandler,
     IrohTransportClient, MethodHandler, MethodRegistry, RpcClient, RpcContext, RpcError, RpcResult,
-    RpcServer,
+    RpcServer, RpcServerConfig,
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -369,5 +369,467 @@ async fn datagram_dispatch_roundtrip() -> Result<()> {
     drop(recorded);
 
     task.abort();
+    Ok(())
+}
+
+// =============================================================================
+// Adversarial scenarios — verify the framework's resilience against:
+//  - concurrent fan-out (parallel calls do NOT serialise)
+//  - mid-RPC connection drops (client surfaces transport error cleanly)
+//  - malformed inbound bytes (server stays alive, returns MalformedFrame)
+//  - handler-returned errors (client decodes RpcError::Handler)
+//  - large payloads (1 MiB roundtrip stays within 8 MiB read limit)
+//  - datagram unknown tokens (DatagramTokenUnknown surfaced)
+//  - bounded concurrent streams (Semaphore enforces max_concurrent_streams)
+// =============================================================================
+
+/// Sleep-then-respond handler — used к verify parallel calls do not serialise.
+struct SlowHandler {
+    delay: Duration,
+    invocations: Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[async_trait]
+impl MethodHandler for SlowHandler {
+    async fn handle(&self, _ctx: RpcContext, _request: Bytes) -> RpcResult<Bytes> {
+        self.invocations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        Ok(Bytes::from_static(b"OK"))
+    }
+}
+
+#[tokio::test]
+async fn concurrent_calls_do_not_serialize() -> Result<()> {
+    let (fix, _tmp_a, _tmp_b) = build_duo("conc-alpha", "conc-bravo").await?;
+
+    let invocations = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut registry = MethodRegistry::new();
+    registry.register(
+        "test:hello@1.0.0/test/slow",
+        Arc::new(SlowHandler {
+            delay: Duration::from_millis(300),
+            invocations: Arc::clone(&invocations),
+        }),
+    );
+    let registry = Arc::new(registry);
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    server.serve().await.context("server.serve")?;
+
+    let client = RpcClient::new(fix.alpha_transport.clone());
+    let bravo_id = fix.bravo_transport.node_id();
+
+    // Launch 10 parallel calls. Serial execution would take 10 × 300ms = 3 s;
+    // parallel must complete well under 2 s wall-clock.
+    let start = std::time::Instant::now();
+    let mut tasks = Vec::with_capacity(10);
+    for _ in 0..10_u32 {
+        let client = client.clone();
+        let bravo_id_owned = bravo_id;
+        tasks.push(tokio::spawn(async move {
+            client
+                .call(
+                    &bravo_id_owned,
+                    "test:hello@1.0.0/test/slow",
+                    Bytes::from_static(b"REQ"),
+                )
+                .await
+        }));
+    }
+    let mut all_ok = 0;
+    for t in tasks {
+        let r = t.await.context("join")?;
+        if r.is_ok() {
+            all_ok += 1;
+        }
+    }
+    let elapsed = start.elapsed();
+    assert_eq!(all_ok, 10, "all parallel calls must succeed");
+    assert!(
+        elapsed < Duration::from_millis(2000),
+        "10 parallel calls с 300ms handler delay must finish < 2s wall-clock; got {elapsed:?}",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn mid_rpc_connection_drop_surfaces_transport_error() -> Result<()> {
+    let (fix, _tmp_a, _tmp_b) = build_duo("drop-alpha", "drop-bravo").await?;
+
+    // Handler that takes long enough that we can drop the server transport
+    // mid-call.
+    let mut registry = MethodRegistry::new();
+    registry.register(
+        "test:hello@1.0.0/test/slow",
+        Arc::new(SlowHandler {
+            delay: Duration::from_secs(5),
+            invocations: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }),
+    );
+    let registry = Arc::new(registry);
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    server.serve().await.context("server.serve")?;
+
+    let client = RpcClient::new(fix.alpha_transport.clone());
+    let bravo_id = fix.bravo_transport.node_id();
+
+    // Spawn the call в background, then drop bravo's transport handle к
+    // tear down the QUIC connection before the handler completes.
+    let call_handle = {
+        let client = client.clone();
+        let bravo_id_owned = bravo_id;
+        tokio::spawn(async move {
+            client
+                .call(
+                    &bravo_id_owned,
+                    "test:hello@1.0.0/test/slow",
+                    Bytes::from_static(b"REQ"),
+                )
+                .await
+        })
+    };
+
+    // Give the request enough time к hit the server и start the handler.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Tear down the bravo endpoint — this closes its iroh Endpoint и
+    // all active connections, signalling CONNECTION_CLOSE к alpha.
+    // We close the underlying iroh Endpoint (Endpoint::close takes &self,
+    // works through Arc<Client>::endpoint()) rather than calling
+    // Client::shutdown() which consumes self.
+    let bravo_inner = Arc::clone(fix.bravo_transport.inner());
+    bravo_inner.endpoint().close().await;
+
+    // Client side must surface а concrete transport error (TransportRead
+    // or similar) — not silently hang or return success.
+    let result = timeout(Duration::from_secs(15), call_handle)
+        .await
+        .context("call wedged after server shutdown")?
+        .context("join")?;
+    assert!(
+        result.is_err(),
+        "call must error after mid-RPC server shutdown; got {result:?}",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_inbound_does_not_crash_server() -> Result<()> {
+    let (fix, _tmp_a, _tmp_b) = build_duo("mal-alpha", "mal-bravo").await?;
+
+    let mut registry = MethodRegistry::new();
+    registry.register("test:hello@1.0.0/test/echo", Arc::new(EchoMethodHandler));
+    let registry = Arc::new(registry);
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    server.serve().await.context("server.serve")?;
+
+    let bravo_id = fix.bravo_transport.node_id();
+
+    // Open the bidi substream directly without RpcClient framing so we
+    // can ship garbage opcodes.  We bypass RpcClient::call entirely
+    // because it auto-frames с OPCODE_UNARY_REQUEST.
+    let alpha_inner = Arc::clone(fix.alpha_transport.inner());
+    let (mut send, mut recv) = alpha_inner
+        .open_substream(&bravo_id, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0)
+        .await
+        .context("open_substream")?;
+
+    // Garbage payload — opcode 0x99 is not а legal frame opcode.
+    send.write_all(&[0x99, 0xFF, 0xAA, 0xBB])
+        .await
+        .context("write garbage")?;
+    send.finish().context("finish garbage")?;
+
+    // Server must respond с а typed MalformedFrame error frame, not
+    // hang or panic.
+    let response_buf = timeout(Duration::from_secs(15), recv.read_to_end(8 * 1024))
+        .await
+        .context("server hung on garbage frame")?
+        .context("read_to_end on garbage response")?;
+    // The response frame is OPCODE_UNARY_ERROR (0x02) followed by а
+    // postcard-encoded WireError::MalformedFrame.  We only assert the
+    // opcode byte here — the framework's typed-error contract is
+    // covered by the lib tests.
+    assert!(
+        !response_buf.is_empty(),
+        "server must respond с error frame"
+    );
+    assert_eq!(
+        response_buf[0], 0x02,
+        "first byte must be OPCODE_UNARY_ERROR",
+    );
+
+    // Subsequent legal calls on а fresh stream must STILL succeed —
+    // the server task survived the malformed input.
+    let client = RpcClient::new(fix.alpha_transport.clone());
+    let response = timeout(
+        Duration::from_secs(15),
+        client.call(
+            &bravo_id,
+            "test:hello@1.0.0/test/echo",
+            Bytes::from_static(b"AFTER-GARBAGE"),
+        ),
+    )
+    .await
+    .context("post-garbage call timed out")?
+    .context("post-garbage call errored")?;
+    assert_eq!(
+        &response[..],
+        b"AFTER-GARBAGE",
+        "server must still serve legal calls after rejecting garbage",
+    );
+    Ok(())
+}
+
+/// Handler that always returns an `RpcError::Handler` carrying а domain error.
+struct ErroringHandler;
+
+#[async_trait]
+impl MethodHandler for ErroringHandler {
+    async fn handle(&self, _ctx: RpcContext, _request: Bytes) -> RpcResult<Bytes> {
+        Err(RpcError::Handler(
+            "domain failure: invalid input".to_string().into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn handler_returns_error_propagates() -> Result<()> {
+    let (fix, _tmp_a, _tmp_b) = build_duo("herr-alpha", "herr-bravo").await?;
+
+    let mut registry = MethodRegistry::new();
+    registry.register("test:hello@1.0.0/test/fail", Arc::new(ErroringHandler));
+    let registry = Arc::new(registry);
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    server.serve().await.context("server.serve")?;
+
+    let client = RpcClient::new(fix.alpha_transport.clone());
+    let bravo_id = fix.bravo_transport.node_id();
+
+    let err = timeout(
+        Duration::from_secs(15),
+        client.call(
+            &bravo_id,
+            "test:hello@1.0.0/test/fail",
+            Bytes::from_static(b"REQ"),
+        ),
+    )
+    .await
+    .context("call timed out")?
+    .expect_err("handler error must surface as RpcError::Handler");
+    match err {
+        RpcError::Handler(inner) => {
+            // The Display message should come through verbatim — handler
+            // errors are opaque-but-textual at the wire boundary.
+            let s = inner.to_string();
+            assert!(
+                s.contains("domain failure"),
+                "handler error display must contain inner message; got `{s}`",
+            );
+        }
+        other => panic!("expected RpcError::Handler, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn large_payload_1mb_roundtrip() -> Result<()> {
+    let (fix, _tmp_a, _tmp_b) = build_duo("big-alpha", "big-bravo").await?;
+
+    let mut registry = MethodRegistry::new();
+    registry.register("test:hello@1.0.0/test/echo", Arc::new(EchoMethodHandler));
+    let registry = Arc::new(registry);
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    server.serve().await.context("server.serve")?;
+
+    let client = RpcClient::new(fix.alpha_transport.clone());
+    let bravo_id = fix.bravo_transport.node_id();
+
+    // 1 MiB payload, well under the 8 MiB cap on either side.
+    let payload = Bytes::from(vec![0xAB; 1024 * 1024]);
+    let response = timeout(
+        Duration::from_secs(30),
+        client.call(&bravo_id, "test:hello@1.0.0/test/echo", payload.clone()),
+    )
+    .await
+    .context("call timed out")?
+    .context("call errored")?;
+    assert_eq!(response.len(), payload.len(), "response length mismatch");
+    assert_eq!(&response[..], &payload[..], "response payload mismatch");
+    Ok(())
+}
+
+#[tokio::test]
+async fn datagram_unknown_token_observable() -> Result<()> {
+    // The datagram dispatcher's behaviour on an unregistered token is а
+    // unit-tested concern (see datagram::tests::dispatch_unknown_token_errors),
+    // but we want к verify it integrates cleanly с the broadcast-loop
+    // path used by real datagram traffic.
+    let (fix, _tmp_a, _tmp_b) = build_duo("unk-tok-alpha", "unk-tok-bravo").await?;
+
+    let dispatcher = Arc::new(DatagramDispatcher::new());
+    // Token 99 is intentionally NOT registered.
+
+    let bravo_inner = Arc::clone(fix.bravo_transport.inner());
+    let dispatcher_loop = Arc::clone(&dispatcher);
+    let mut rx = bravo_inner.subscribe_datagrams();
+    let observed = Arc::new(Mutex::new(Vec::<RpcError>::new()));
+    let observed_clone = Arc::clone(&observed);
+    let task = tokio::spawn(async move {
+        if let Ok(frame) = rx.recv().await {
+            let ctx = DatagramDispatcher::build_context(frame.from_peer);
+            // Dispatch must return DatagramTokenUnknown — observable via
+            // the returned error, not silently swallowed.
+            let r = dispatcher_loop.dispatch(ctx, frame.payload.clone()).await;
+            if let Err(e) = r {
+                observed_clone.lock().await.push(e);
+            }
+        }
+    });
+
+    // Send а datagram с token=99 (unregistered).
+    let alpha_inner = Arc::clone(fix.alpha_transport.inner());
+    let bravo_id = fix.bravo_transport.node_id();
+    let mut payload = Vec::new();
+    payload.push(99u8);
+    payload.extend_from_slice(b"GHOST-FRAME");
+    timeout(
+        Duration::from_secs(15),
+        alpha_inner.send_datagram(&bravo_id, "bravo", &payload),
+    )
+    .await
+    .context("send_datagram timed out")?
+    .context("send_datagram errored")?;
+
+    // Wait briefly for the dispatcher loop к observe the frame.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let errors = observed.lock().await;
+    assert_eq!(
+        errors.len(),
+        1,
+        "exactly one DatagramTokenUnknown error must be observable",
+    );
+    match &errors[0] {
+        RpcError::DatagramTokenUnknown { token } => assert_eq!(*token, 99),
+        other => panic!("expected DatagramTokenUnknown, got {other:?}"),
+    }
+    drop(errors);
+    task.abort();
+    Ok(())
+}
+
+/// Barrier handler — increments а counter on entry, blocks until
+/// notified, decrements on exit. Lets us assert how many concurrent
+/// invocations are in flight at any moment.
+struct BarrierHandler {
+    in_flight: Arc<std::sync::atomic::AtomicU32>,
+    max_observed: Arc<std::sync::atomic::AtomicU32>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl MethodHandler for BarrierHandler {
+    async fn handle(&self, _ctx: RpcContext, _request: Bytes) -> RpcResult<Bytes> {
+        let cur = self
+            .in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        // Track the maximum concurrency we ever observed.
+        self.max_observed
+            .fetch_max(cur, std::sync::atomic::Ordering::SeqCst);
+        self.release.notified().await;
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Bytes::from_static(b"OK"))
+    }
+}
+
+#[tokio::test]
+async fn max_concurrent_streams_enforced() -> Result<()> {
+    let (fix, _tmp_a, _tmp_b) = build_duo("sem-alpha", "sem-bravo").await?;
+
+    let in_flight = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let max_observed = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+
+    let mut registry = MethodRegistry::new();
+    registry.register(
+        "test:hello@1.0.0/test/wait",
+        Arc::new(BarrierHandler {
+            in_flight: Arc::clone(&in_flight),
+            max_observed: Arc::clone(&max_observed),
+            release: Arc::clone(&release),
+        }),
+    );
+    let registry = Arc::new(registry);
+
+    // Cap at 2 concurrent streams. Connection cap stays at default 1024
+    // so it does not interfere с the test.
+    let cfg = RpcServerConfig {
+        max_concurrent_streams: 2,
+        max_concurrent_connections: 1024,
+    };
+    let server = RpcServer::with_config(fix.bravo_transport.clone(), Arc::clone(&registry), cfg);
+    server.serve().await.context("server.serve")?;
+
+    let client = RpcClient::new(fix.alpha_transport.clone());
+    let bravo_id = fix.bravo_transport.node_id();
+
+    // Launch 5 parallel calls. With max_concurrent_streams=2, at most
+    // 2 of them can be inside the handler at once until we release them.
+    let mut tasks = Vec::with_capacity(5);
+    for _ in 0..5_u32 {
+        let client = client.clone();
+        let bravo_id_owned = bravo_id;
+        tasks.push(tokio::spawn(async move {
+            client
+                .call(
+                    &bravo_id_owned,
+                    "test:hello@1.0.0/test/wait",
+                    Bytes::from_static(b"REQ"),
+                )
+                .await
+        }));
+    }
+
+    // Give time for the bound к take effect (semaphore releases on
+    // task drop, not on `await` return — but no task can complete until
+    // we notify the barrier).
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let observed_now = in_flight.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        observed_now <= 2,
+        "in-flight handler count {observed_now} exceeds Semaphore cap of 2",
+    );
+
+    // Release ALL pending handlers (notify_waiters wakes everyone).
+    for _ in 0..10 {
+        release.notify_one();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    // Wake any stragglers that arrived after the first batch released.
+    for _ in 0..10 {
+        release.notify_one();
+    }
+
+    let mut succeeded = 0;
+    for t in tasks {
+        match timeout(Duration::from_secs(15), t).await {
+            Ok(Ok(Ok(_))) => succeeded += 1,
+            Ok(Ok(Err(e))) => panic!("call errored: {e:?}"),
+            Ok(Err(e)) => panic!("join error: {e:?}"),
+            Err(elapsed) => panic!("call timed out after {elapsed:?}"),
+        }
+    }
+    assert_eq!(succeeded, 5, "all 5 calls must complete after release");
+
+    // The peak concurrent in-flight count must be ≤ Semaphore cap.
+    let peak = max_observed.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        peak <= 2,
+        "max concurrent in-flight handlers was {peak}, expected ≤ 2 (Semaphore cap)",
+    );
     Ok(())
 }
