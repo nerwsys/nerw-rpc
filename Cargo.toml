@@ -1,0 +1,62 @@
+[package]
+name = "nerw-rpc"
+version = "0.3.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Mesh-agnostic RPC framework over iroh with WIT contracts + postcard wire format"
+repository = "https://github.com/nerwsys/nerw-rpc"
+documentation = "https://docs.rs/nerw-rpc"
+readme = "README.md"
+keywords = ["rpc", "mesh", "iroh", "p2p", "wit"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+postcard = { version = "1.0", features = ["use-std"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "sync", "macros", "io-util", "time"] }
+thiserror = "1.0"
+bytes = "1.5"
+tracing = "0.1"
+leb128 = "0.2"
+uuid = { version = "1.7", features = ["v4", "serde"] }
+async-trait = "0.1"
+
+# Phase 2 — iroh transport binding (path dep к local nerw-core checkout).
+#
+# Caret semver pin (`"0.98"` matches `>=0.98.0, <0.99.0`) is acceptable
+# during workspace development — Cargo.lock anchors the exact resolved
+# version, and our nerw-core path-dep already locks к а specific iroh
+# minor.  Когда nerw-rpc ships к crates.io, switch к an exact pin
+# (`= "0.98.x"`) matching nerw-core's locked iroh version, so consumers
+# of the published crate cannot accidentally pull а semver-incompatible
+# iroh patch into the same dependency tree.
+iroh = "0.98"
+nerw-core = { path = "/src/nerw/crates/nerw-core" }
+parking_lot = "0.12"
+
+# DashMap — concurrent hash map keyed by stream-id для DatagramDispatcher.
+# Replaces the previous 256-slot fixed array (token-byte indexed) с
+# unbounded capacity necessary for WebTransport-style stream-id correlation
+# (RFC 9221 + WebTransport datagram framing). The dashmap crate provides
+# O(1) read/write без а global lock — sharded internally — and is widely
+# vetted (used by Tokio, Axum, etc.).  Version "6" tracks the latest
+# stable major; previous "5.x" series is end-of-life.
+dashmap = "6"
+
+[dev-dependencies]
+anyhow = "1.0"
+tokio = { version = "1", features = ["full", "test-util"] }
+serde_test = "1.0"
+tempfile = "3.10"
+rcgen = "0.14"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
