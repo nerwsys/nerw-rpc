@@ -1,6 +1,6 @@
 [package]
 name = "nerw-rpc"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Mesh-agnostic RPC framework over iroh with WIT contracts + postcard wire format"
@@ -33,6 +33,15 @@ async-trait = "0.1"
 iroh = "0.98"
 nerw-core = { path = "/src/nerw/crates/nerw-core" }
 parking_lot = "0.12"
+
+# DashMap — concurrent hash map keyed by stream-id для DatagramDispatcher.
+# Replaces the previous 256-slot fixed array (token-byte indexed) с
+# unbounded capacity necessary for WebTransport-style stream-id correlation
+# (RFC 9221 + WebTransport datagram framing). The dashmap crate provides
+# O(1) read/write без а global lock — sharded internally — and is widely
+# vetted (used by Tokio, Axum, etc.).  Version "6" tracks the latest
+# stable major; previous "5.x" series is end-of-life.
+dashmap = "6"
 
 [dev-dependencies]
 anyhow = "1.0"
