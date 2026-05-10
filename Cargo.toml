@@ -1,6 +1,6 @@
 [package]
 name = "nerw-rpc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Mesh-agnostic RPC framework over iroh with WIT contracts + postcard wire format"
@@ -21,10 +21,17 @@ leb128 = "0.2"
 uuid = { version = "1.7", features = ["v4", "serde"] }
 async-trait = "0.1"
 
+# Phase 2 — iroh transport binding (path dep к local nerw-core checkout).
+iroh = "0.98"
+nerw-core = { path = "/src/nerw/crates/nerw-core" }
+parking_lot = "0.12"
+
 [dev-dependencies]
 anyhow = "1.0"
 tokio = { version = "1", features = ["full", "test-util"] }
 serde_test = "1.0"
+tempfile = "3.10"
+rcgen = "0.14"
 
 [lints.rust]
 unsafe_code = "forbid"
