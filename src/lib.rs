@@ -24,6 +24,7 @@
 #![doc(html_root_url = "https://docs.rs/nerw-rpc/0.1.0")]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
 
+pub mod client;
 pub mod codec;
 pub mod context;
 pub mod error;
@@ -38,6 +39,7 @@ pub use crate::context::{
     loopback_node_id,
 };
 pub use crate::error::{RpcError, RpcResult};
+pub use crate::client::RpcClient;
 pub use crate::method::{MethodHandler, MethodName, MethodRegistry};
 pub use crate::server::RpcServer;
 pub use crate::transport::{

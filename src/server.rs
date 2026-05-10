@@ -301,7 +301,6 @@ async fn write_error(send: &mut iroh::endpoint::SendStream, err: &RpcError) -> R
 /// Returns [`RpcError::MalformedFrame`] if the LEB128 length-prefix
 /// encoding fails (effectively never for an in-memory `Vec`, kept honest
 /// for forward-compat).
-#[allow(dead_code)] // consumed by client.rs (next commit)
 pub(crate) fn build_unary_request_frame(
     method_name: &str,
     request_bytes: &[u8],
