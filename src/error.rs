@@ -1,0 +1,94 @@
+//! Error types для nerw-rpc.
+//!
+//! [`RpcError`] is the framework's top-level error type. Variants split into:
+//!
+//! - **Wire errors** ([`RpcError::Codec`], [`RpcError::MalformedFrame`]) —
+//!   produced by the codec / wire layer when bytes don't decode.
+//! - **Dispatch errors** ([`RpcError::UnknownMethod`],
+//!   [`RpcError::InvalidMethodName`], [`RpcError::VersionMismatch`]) —
+//!   produced by the method registry when no handler matches.
+//! - **Handler errors** ([`RpcError::Handler`]) — opaque wrapper around
+//!   user-defined errors returned from a [`crate::method::MethodHandler`].
+//! - **Transport errors** ([`RpcError::Transport`]) — placeholder for
+//!   Phase 2 iroh integration; concrete wrapping of `iroh::endpoint::*`
+//!   errors will land then.
+
+use thiserror::Error;
+
+/// Top-level error type for nerw-rpc operations.
+#[derive(Debug, Error)]
+pub enum RpcError {
+    /// Postcard codec failure — bytes do not deserialize into the expected type.
+    #[error("codec error: {0}")]
+    Codec(#[from] postcard::Error),
+
+    /// Wire frame structure violated (truncated buffer, bad opcode, …).
+    #[error("malformed wire frame: {0}")]
+    MalformedFrame(String),
+
+    /// No handler registered for the requested canonical method name.
+    #[error("unknown method: {0}")]
+    UnknownMethod(String),
+
+    /// Method name string did not match `package[@version]/interface/method` grammar.
+    #[error("invalid method-name format: expected `package[@version]/interface/method`, got `{0}`")]
+    InvalidMethodName(String),
+
+    /// Caller pinned a specific version that is not available; the registry
+    /// reports which versions it knows about.
+    #[error("version mismatch: requested {requested}, available {available:?}")]
+    VersionMismatch {
+        /// Version string the caller asked for.
+        requested: String,
+        /// Versions the registry has registered for this `package/interface/method` triple.
+        available: Vec<String>,
+    },
+
+    /// User handler returned an error. The original error type is erased
+    /// behind a `Box<dyn Error>` so the framework stays generic over
+    /// application error hierarchies.
+    #[error("handler error: {0}")]
+    Handler(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    /// Transport layer failure (placeholder for Phase 2 iroh integration).
+    #[error("transport error: {0}")]
+    Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Convenience alias for `Result<T, RpcError>`.
+pub type RpcResult<T> = Result<T, RpcError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_method_displays_name() {
+        let err = RpcError::UnknownMethod("foo:bar@1.0.0/iface/m".to_string());
+        let s = err.to_string();
+        assert!(s.contains("foo:bar@1.0.0/iface/m"));
+    }
+
+    #[test]
+    fn version_mismatch_displays_both() {
+        let err = RpcError::VersionMismatch {
+            requested: "2.0.0".to_string(),
+            available: vec!["1.0.0".to_string(), "1.1.0".to_string()],
+        };
+        let s = err.to_string();
+        assert!(s.contains("2.0.0"));
+        assert!(s.contains("1.0.0"));
+    }
+
+    #[test]
+    fn codec_error_wraps_postcard() {
+        // Decoding empty bytes as a struct triggers a postcard error.
+        #[derive(Debug, serde::Deserialize)]
+        struct Sample {
+            _a: u32,
+        }
+        let res: Result<Sample, _> = postcard::from_bytes(&[]);
+        let err: RpcError = res.expect_err("decode of empty buffer must fail").into();
+        assert!(matches!(err, RpcError::Codec(_)));
+    }
+}
