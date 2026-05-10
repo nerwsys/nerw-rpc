@@ -33,6 +33,7 @@ pub mod method;
 pub mod server;
 pub mod transport;
 pub mod wire;
+pub mod wire_error;
 
 // Re-exports для конвенции
 pub use crate::client::RpcClient;
@@ -48,3 +49,4 @@ pub use crate::transport::{
     ALPN_NERW_RPC_2_0_0, ALPN_TOLKI_DATAGRAM_1_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0,
     IrohTransportClient, NERW_RPC_ALPNS,
 };
+pub use crate::wire_error::WireError;

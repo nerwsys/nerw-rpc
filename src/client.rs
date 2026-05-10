@@ -19,6 +19,7 @@ use crate::error::{RpcError, RpcResult};
 use crate::server::build_unary_request_frame;
 use crate::transport::{ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, IrohTransportClient};
 use crate::wire::{OPCODE_UNARY_ERROR, OPCODE_UNARY_RESPONSE};
+use crate::wire_error::WireError;
 
 /// Maximum bytes we accept from а server response — protects clients
 /// against а malicious server trying к exhaust memory by writing forever.
@@ -122,7 +123,13 @@ impl RpcClient {
 }
 
 /// Decode а response frame: `[OPCODE_UNARY_RESPONSE | bytes]` (success)
-/// or `[OPCODE_UNARY_ERROR | postcard(error-string)]` (failure).
+/// or `[OPCODE_UNARY_ERROR | postcard(WireError)]` (failure).
+///
+/// The error body is the typed [`WireError`] envelope — а 1-byte
+/// discriminant followed by the postcard-encoded payload. Reconstruction
+/// is total: every wire variant maps к а concrete [`RpcError`] variant
+/// without ambiguity. Locale invariant — translating display strings
+/// в Russian (or anywhere else) does not affect classification.
 fn decode_response_frame(buf: &[u8]) -> RpcResult<Vec<u8>> {
     let (opcode, rest) = buf
         .split_first()
@@ -130,17 +137,8 @@ fn decode_response_frame(buf: &[u8]) -> RpcResult<Vec<u8>> {
     match *opcode {
         OPCODE_UNARY_RESPONSE => Ok(rest.to_vec()),
         OPCODE_UNARY_ERROR => {
-            let msg: String = postcard::from_bytes(rest).map_err(RpcError::Codec)?;
-            // Distinguish well-known error shapes from generic handler
-            // errors so callers can match cleanly. Phase 2 ships а
-            // simple string protocol; Phase 3+ will switch к а typed
-            // postcard discriminant.
-            if msg.starts_with("unknown method:") {
-                let name = msg.trim_start_matches("unknown method:").trim().to_string();
-                Err(RpcError::UnknownMethod(name))
-            } else {
-                Err(RpcError::Handler(msg.into()))
-            }
+            let wire: WireError = postcard::from_bytes(rest).map_err(RpcError::Codec)?;
+            Err(wire.into_rpc_error())
         }
         other => Err(RpcError::MalformedFrame(format!(
             "unexpected response opcode 0x{other:02x}",
@@ -166,7 +164,10 @@ mod tests {
     fn decode_response_frame_error_handler() {
         let mut buf = Vec::new();
         buf.push(OPCODE_UNARY_ERROR);
-        let body = postcard::to_allocvec(&"some handler failure".to_string()).expect("encode");
+        let body = postcard::to_allocvec(&WireError::HandlerError {
+            display: "some handler failure".to_string(),
+        })
+        .expect("encode");
         buf.extend_from_slice(&body);
         let err = decode_response_frame(&buf).expect_err("must error");
         match err {
@@ -179,9 +180,10 @@ mod tests {
     fn decode_response_frame_error_unknown_method() {
         let mut buf = Vec::new();
         buf.push(OPCODE_UNARY_ERROR);
-        let body =
-            postcard::to_allocvec(&"unknown method: tolki:nope@1.0.0/iface/method".to_string())
-                .expect("encode");
+        let body = postcard::to_allocvec(&WireError::UnknownMethod {
+            method_name: "tolki:nope@1.0.0/iface/method".to_string(),
+        })
+        .expect("encode");
         buf.extend_from_slice(&body);
         let err = decode_response_frame(&buf).expect_err("must error");
         match err {
@@ -189,6 +191,32 @@ mod tests {
                 assert_eq!(name, "tolki:nope@1.0.0/iface/method");
             }
             other => panic!("expected RpcError::UnknownMethod, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_response_frame_error_version_mismatch() {
+        // Demonstrates the new typed wire format preserves variant + metadata
+        // even when the human-readable Display would not survive а string-prefix
+        // match (e.g. translated к Russian).
+        let mut buf = Vec::new();
+        buf.push(OPCODE_UNARY_ERROR);
+        let body = postcard::to_allocvec(&WireError::VersionMismatch {
+            requested: "9.9.9".to_string(),
+            available: vec!["1.0.0".to_string(), "2.0.0".to_string()],
+        })
+        .expect("encode");
+        buf.extend_from_slice(&body);
+        let err = decode_response_frame(&buf).expect_err("must error");
+        match err {
+            RpcError::VersionMismatch {
+                requested,
+                available,
+            } => {
+                assert_eq!(requested, "9.9.9");
+                assert_eq!(available, vec!["1.0.0".to_string(), "2.0.0".to_string()]);
+            }
+            other => panic!("expected RpcError::VersionMismatch, got {other:?}"),
         }
     }
 

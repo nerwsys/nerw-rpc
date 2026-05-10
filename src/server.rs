@@ -44,6 +44,7 @@ use crate::wire::{
     OPCODE_UNARY_ERROR, OPCODE_UNARY_REQUEST, OPCODE_UNARY_RESPONSE, decode_method_name,
     encode_method_name,
 };
+use crate::wire_error::WireError;
 
 /// Maximum bytes we accept on а single inbound RPC stream — protects
 /// against а malicious peer trying к exhaust memory by writing forever.
@@ -269,14 +270,17 @@ async fn write_response(send: &mut iroh::endpoint::SendStream, response: &[u8]) 
     Ok(())
 }
 
-/// Frame an error response: `[OPCODE_UNARY_ERROR | postcard(error-string)]`.
+/// Frame an error response: `[OPCODE_UNARY_ERROR | postcard(WireError)]`.
 ///
-/// Phase 2 ships а minimal error encoding — а single postcard-encoded
-/// `String` describing the failure. Phase 3+ may upgrade this к а
-/// richer typed-error encoding once the wire format stabilises.
+/// The body is а typed [`WireError`] envelope с а 1-byte discriminant
+/// followed by the postcard-encoded payload. The discriminant byte
+/// makes wire decoding **locale-invariant** — а maintainer translating
+/// human-readable error strings cannot accidentally break client-side
+/// error classification (which would happen if we shipped а bare
+/// `String` and the client matched on prefixes).
 async fn write_error(send: &mut iroh::endpoint::SendStream, err: &RpcError) -> RpcResult<()> {
-    let body = err.to_string();
-    let body_bytes = postcard::to_allocvec(&body).map_err(RpcError::Codec)?;
+    let wire = WireError::from_rpc_error(err);
+    let body_bytes = postcard::to_allocvec(&wire).map_err(RpcError::Codec)?;
     let mut buf = Vec::with_capacity(1 + body_bytes.len());
     buf.push(OPCODE_UNARY_ERROR);
     buf.extend_from_slice(&body_bytes);
