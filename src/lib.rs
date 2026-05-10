@@ -28,6 +28,7 @@ pub mod codec;
 pub mod context;
 pub mod error;
 pub mod method;
+pub mod transport;
 pub mod wire;
 
 // Re-exports для конвенции
@@ -37,3 +38,7 @@ pub use crate::context::{
 };
 pub use crate::error::{RpcError, RpcResult};
 pub use crate::method::{MethodHandler, MethodName, MethodRegistry};
+pub use crate::transport::{
+    ALPN_NERW_RPC_2_0_0, ALPN_TOLKI_DATAGRAM_1_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0,
+    IrohTransportClient, NERW_RPC_ALPNS,
+};
