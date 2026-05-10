@@ -38,7 +38,7 @@ use iroh::{EndpointAddr, TransportAddr};
 use nerw_core::client::{Client, ClientConfig};
 use nerw_core::protocol::ALPN_NERW_RPC;
 use nerw_rpc::{
-    ALPN_TOLKI_DATAGRAM_1_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, DatagramDispatcher, DatagramHandler,
+    ALPN_TOLKI_DATAGRAM_2_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, DatagramDispatcher, DatagramHandler,
     IrohTransportClient, MethodHandler, MethodRegistry, RpcClient, RpcContext, RpcError, RpcResult,
     RpcServer, RpcServerConfig,
 };
@@ -74,7 +74,7 @@ fn make_test_config(tmp: &TempDir, label: &str) -> Result<(ClientConfig, PathBuf
         .with_relay_url("https://127.0.0.1:1/")
         .with_alpn(ALPN_NERW_RPC.to_vec())
         .with_alpn(ALPN_TOLKI_WIRE_PROTOCOL_2_0_0.to_vec())
-        .with_alpn(ALPN_TOLKI_DATAGRAM_1_0_0.to_vec())
+        .with_alpn(ALPN_TOLKI_DATAGRAM_2_0_0.to_vec())
         .with_discovery(None)
         .build();
     Ok((cfg, identity_path))

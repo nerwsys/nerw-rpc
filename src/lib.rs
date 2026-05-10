@@ -48,7 +48,7 @@ pub use crate::server::{
     DEFAULT_MAX_CONCURRENT_CONNECTIONS, DEFAULT_MAX_CONCURRENT_STREAMS, RpcServer, RpcServerConfig,
 };
 pub use crate::transport::{
-    ALPN_NERW_RPC_2_0_0, ALPN_TOLKI_DATAGRAM_1_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0,
+    ALPN_NERW_RPC_2_0_0, ALPN_TOLKI_DATAGRAM_2_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0,
     IrohTransportClient, NERW_RPC_ALPNS,
 };
 pub use crate::wire_error::WireError;

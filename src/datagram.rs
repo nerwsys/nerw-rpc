@@ -40,7 +40,7 @@ use tracing::trace;
 
 use crate::context::{PeerMetadata, RpcContext, TimingInfo, TracingInfo};
 use crate::error::{RpcError, RpcResult};
-use crate::transport::ALPN_TOLKI_DATAGRAM_1_0_0;
+use crate::transport::ALPN_TOLKI_DATAGRAM_2_0_0;
 
 /// Handler trait for datagram tokens — application code implements
 /// this once per registered sub-protocol slot.
@@ -194,18 +194,18 @@ impl DatagramDispatcher {
     /// [`nerw_core::client::Client::subscribe_datagrams`]. The
     /// [`PeerMetadata::node_id`] is the [`iroh::EndpointId`] copied
     /// from the inbound `DatagramFrame::from_peer`. The ALPN field
-    /// reflects [`ALPN_TOLKI_DATAGRAM_1_0_0`] regardless of which QUIC
+    /// reflects [`ALPN_TOLKI_DATAGRAM_2_0_0`] regardless of which QUIC
     /// connection actually carried the datagram — datagrams ride on
     /// the same connection as nerw RPC (Quinn multiplexes streams +
     /// datagrams in one session) but logically belong к the
-    /// tolki/datagram/1.0.0 sub-protocol.
+    /// tolki/datagram/2.0.0 sub-protocol.
     #[must_use]
     pub fn build_context(from_peer: iroh::EndpointId) -> RpcContext {
         let peer = PeerMetadata {
             node_id: from_peer,
             connection_id: 0,
             stream_id: 0,
-            alpn: ALPN_TOLKI_DATAGRAM_1_0_0.to_vec(),
+            alpn: ALPN_TOLKI_DATAGRAM_2_0_0.to_vec(),
             handshake_at_ms: 0,
             tls_cipher_suite: None,
         };
@@ -345,7 +345,7 @@ mod tests {
         let id = loopback_node_id();
         let ctx = DatagramDispatcher::build_context(id);
         assert_eq!(ctx.peer.node_id, id);
-        assert_eq!(ctx.peer.alpn, ALPN_TOLKI_DATAGRAM_1_0_0);
+        assert_eq!(ctx.peer.alpn, ALPN_TOLKI_DATAGRAM_2_0_0);
         assert!(ctx.auth.is_none());
     }
 }
