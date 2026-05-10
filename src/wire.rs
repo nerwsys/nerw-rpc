@@ -13,8 +13,8 @@
 //!   Item:        [opcode=0x11 | postcard(item)]
 //!   End:         [opcode=0x12 | optional-postcard(trailer)]
 //!
-//! DATAGRAM:
-//!   [token 1B | postcard(item)]
+//! DATAGRAM (WebTransport-style stream-id correlation):
+//!   [varint(stream-id) | postcard(item)]
 //! ```
 //!
 //! Phase 1 ships only the framing primitives — opcodes and the method-name
@@ -100,6 +100,47 @@ pub fn decode_method_name(input: &[u8]) -> RpcResult<(&str, &[u8])> {
     Ok((name, &input[consumed + name_len..]))
 }
 
+/// Encode а datagram stream-id prefix as а LEB128 varint.
+///
+/// Used by callers building outbound datagram frames: the wire shape is
+/// `[varint(stream-id) | postcard(payload)]`. The stream-id is the
+/// `u64` identifier of the bidi handshake stream that established the
+/// datagram session (per WebTransport-style correlation, RFC 9221 +
+/// CONNECT-UDP / WebTransport).
+///
+/// The encoded bytes are appended к `buf`.
+///
+/// # Errors
+///
+/// Returns [`RpcError::MalformedFrame`] if the underlying LEB128 writer
+/// fails (only possible on I/O error against an in-memory `Vec`, so
+/// practically never — kept honest для symmetry с
+/// [`encode_method_name`] и future `no_std` callers).
+pub fn encode_stream_id(stream_id: u64, buf: &mut Vec<u8>) -> RpcResult<()> {
+    leb128::write::unsigned(buf, stream_id)
+        .map_err(|e| RpcError::MalformedFrame(format!("leb128 write stream-id: {e}")))?;
+    Ok(())
+}
+
+/// Decode а datagram stream-id prefix from `[varint(stream-id) | rest]`.
+///
+/// Returns the decoded stream-id и the remaining bytes (typically the
+/// postcard-encoded application payload, handed unchanged к the
+/// registered [`crate::datagram::DatagramHandler`]).
+///
+/// # Errors
+///
+/// Returns [`RpcError::MalformedFrame`] if the LEB128 varint is
+/// malformed (truncated buffer, varint overflows `u64`, etc).
+pub fn decode_stream_id(input: &[u8]) -> RpcResult<(u64, &[u8])> {
+    let mut cursor = std::io::Cursor::new(input);
+    let stream_id = leb128::read::unsigned(&mut cursor)
+        .map_err(|e| RpcError::MalformedFrame(format!("leb128 read stream-id: {e}")))?;
+    let consumed = usize::try_from(cursor.position())
+        .map_err(|e| RpcError::MalformedFrame(format!("cursor overflow: {e}")))?;
+    Ok((stream_id, &input[consumed..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +221,63 @@ mod tests {
         assert_eq!(OPCODE_STREAM_OPEN, 0x10);
         assert_eq!(OPCODE_STREAM_ITEM, 0x11);
         assert_eq!(OPCODE_STREAM_END, 0x12);
+    }
+
+    #[test]
+    fn stream_id_roundtrip_small() {
+        // Stream-ids < 64 fit в а single varint byte (matches old 1-byte
+        // token cost для the common case).
+        let mut buf = Vec::new();
+        encode_stream_id(42, &mut buf).expect("encode");
+        assert_eq!(buf.len(), 1, "stream-id 42 must encode к 1 byte");
+        let (decoded, rest) = decode_stream_id(&buf).expect("decode");
+        assert_eq!(decoded, 42);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn stream_id_roundtrip_large() {
+        // Stream-ids в the upper varint range still roundtrip cleanly.
+        let mut buf = Vec::new();
+        encode_stream_id(u64::from(u32::MAX), &mut buf).expect("encode");
+        let (decoded, rest) = decode_stream_id(&buf).expect("decode");
+        assert_eq!(decoded, u64::from(u32::MAX));
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn stream_id_with_payload_after() {
+        let mut buf = Vec::new();
+        encode_stream_id(7, &mut buf).expect("encode");
+        buf.extend_from_slice(b"PAYLOAD");
+        let (decoded, rest) = decode_stream_id(&buf).expect("decode");
+        assert_eq!(decoded, 7);
+        assert_eq!(rest, b"PAYLOAD");
+    }
+
+    #[test]
+    fn stream_id_decode_rejects_empty_buffer() {
+        // Empty buffer cannot carry а varint — leb128 reader signals EOF.
+        let res = decode_stream_id(&[]);
+        assert!(matches!(res, Err(RpcError::MalformedFrame(_))));
+    }
+
+    #[test]
+    fn stream_id_decode_rejects_truncated_varint() {
+        // 0x80 = continuation bit set but no follow-up byte.
+        let bad = [0x80_u8];
+        let res = decode_stream_id(&bad);
+        assert!(matches!(res, Err(RpcError::MalformedFrame(_))));
+    }
+
+    #[test]
+    fn stream_id_zero_roundtrip() {
+        // Boundary: stream-id 0 must encode к а single zero byte.
+        let mut buf = Vec::new();
+        encode_stream_id(0, &mut buf).expect("encode");
+        assert_eq!(buf, vec![0x00]);
+        let (decoded, rest) = decode_stream_id(&buf).expect("decode");
+        assert_eq!(decoded, 0);
+        assert!(rest.is_empty());
     }
 }
