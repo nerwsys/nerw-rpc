@@ -33,6 +33,7 @@ pub mod wire;
 // Re-exports для конвенции
 pub use crate::context::{
     AuthenticatedContext, NodeId, PeerMetadata, RpcContext, SessionInfo, TimingInfo, TracingInfo,
+    loopback_node_id,
 };
 pub use crate::error::{RpcError, RpcResult};
 pub use crate::method::{MethodHandler, MethodName, MethodRegistry};

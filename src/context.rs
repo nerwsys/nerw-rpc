@@ -19,36 +19,23 @@
 //! user behind the encryption layer. Fields here are restricted to opaque
 //! cryptographic identifiers (peer-id, master pubkey, opaque UUIDs).
 //!
-//! ## Phase 1 placeholder
+//! ## Phase 2 — iroh integration
 //!
-//! The transport identity carrier is the local placeholder [`NodeId`]
-//! (32-byte ed25519 public key, the same shape iroh uses). When Phase 2
-//! wires up iroh, [`PeerMetadata::node_id`] will switch to `iroh::NodeId`
-//! and existing fields stay structurally compatible.
+//! The transport identity carrier is now [`iroh::EndpointId`] — the
+//! z-base32-encoded Ed25519 public key proven by the QUIC/TLS handshake.
+//! Phase 1 carried а local placeholder newtype; this module re-exports
+//! `iroh::EndpointId` under the alias [`NodeId`] для backward-compat
+//! с downstream code that imported the old name.
 
 use uuid::Uuid;
 
-/// Placeholder for `iroh::NodeId` — 32-byte ed25519 public key.
+/// Re-export of [`iroh::EndpointId`] — 32-byte Ed25519 public key.
 ///
-/// Phase 1 uses this local newtype so the rest of the crate compiles
-/// without an iroh dependency. Phase 2 swaps it for the real
-/// `iroh::NodeId` (same wire shape, same `Display`/`FromStr` semantics).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NodeId(pub [u8; 32]);
-
-impl NodeId {
-    /// All-zero placeholder node-id — used by tests / loopback transports.
-    #[must_use]
-    pub const fn zero() -> Self {
-        Self([0u8; 32])
-    }
-}
-
-impl Default for NodeId {
-    fn default() -> Self {
-        Self::zero()
-    }
-}
+/// Phase 1 carried а local placeholder; Phase 2 binds this к the real
+/// iroh identity type. The alias is preserved для downstream code that
+/// imported `nerw_rpc::NodeId`; new code may use [`iroh::EndpointId`]
+/// directly.
+pub type NodeId = iroh::EndpointId;
 
 /// Transport-level peer identity captured by the iroh accept loop.
 ///
@@ -84,13 +71,16 @@ pub struct PeerMetadata {
 impl PeerMetadata {
     /// Build a deterministic placeholder suitable for in-memory tests.
     ///
-    /// All fields are filled with stable dummy values so test assertions can
-    /// pin them down. The node-id is all-zero — callers cannot replay it as
-    /// a production identity.
+    /// All fields are filled with stable dummy values so test assertions
+    /// can pin them down. The node-id is derived from an all-zero
+    /// Ed25519 secret seed — а deterministic, never-used-in-production
+    /// public key. Callers cannot replay it as а production identity
+    /// because the corresponding secret is the all-zero vector
+    /// (publicly known).
     #[must_use]
     pub fn loopback() -> Self {
         Self {
-            node_id: NodeId::zero(),
+            node_id: loopback_node_id(),
             connection_id: 0,
             stream_id: 0,
             alpn: b"nerw-rpc/1".to_vec(),
@@ -98,6 +88,17 @@ impl PeerMetadata {
             tls_cipher_suite: None,
         }
     }
+}
+
+/// Deterministic placeholder [`NodeId`] for in-memory tests / loopback
+/// transports — derived from the all-zero Ed25519 secret seed.
+///
+/// Never appears in production: the corresponding secret is publicly
+/// known. Tests use it to pin assertions on а stable identity without
+/// fabricating real iroh keys.
+#[must_use]
+pub fn loopback_node_id() -> NodeId {
+    iroh::SecretKey::from_bytes(&[0u8; 32]).public()
 }
 
 impl Default for PeerMetadata {
@@ -309,16 +310,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn node_id_zero_is_all_zero() {
-        let n = NodeId::zero();
-        assert_eq!(n.0, [0u8; 32]);
+    fn loopback_node_id_is_deterministic() {
+        let a = loopback_node_id();
+        let b = loopback_node_id();
+        assert_eq!(a, b, "loopback_node_id must be deterministic");
     }
 
     #[test]
     fn peer_metadata_loopback_has_alpn() {
         let m = PeerMetadata::loopback();
         assert_eq!(m.alpn, b"nerw-rpc/1");
-        assert_eq!(m.node_id, NodeId::zero());
+        assert_eq!(m.node_id, loopback_node_id());
     }
 
     #[test]
@@ -349,7 +351,7 @@ mod tests {
     #[test]
     fn authenticated_has_scope() {
         let auth = AuthenticatedContext {
-            node_id: NodeId::zero(),
+            node_id: loopback_node_id(),
             master_pubkey: [0u8; 32],
             user_id: Uuid::new_v4(),
             device_id: Uuid::new_v4(),
