@@ -44,7 +44,9 @@ pub use crate::context::{
 pub use crate::datagram::{DatagramDispatcher, DatagramHandler};
 pub use crate::error::{RpcError, RpcResult};
 pub use crate::method::{MethodHandler, MethodName, MethodRegistry};
-pub use crate::server::RpcServer;
+pub use crate::server::{
+    DEFAULT_MAX_CONCURRENT_CONNECTIONS, DEFAULT_MAX_CONCURRENT_STREAMS, RpcServer, RpcServerConfig,
+};
 pub use crate::transport::{
     ALPN_NERW_RPC_2_0_0, ALPN_TOLKI_DATAGRAM_1_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0,
     IrohTransportClient, NERW_RPC_ALPNS,
