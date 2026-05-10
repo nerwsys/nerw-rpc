@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use bytes::{BufMut, Bytes, BytesMut};
 use iroh::endpoint::Connection;
 use nerw_core::client::AlpnHandler;
 use tokio::sync::Semaphore;
@@ -309,8 +310,11 @@ async fn handle_unary_stream(
     // latency measurements include time spent в stream-read.
     let accept_instant = std::time::Instant::now();
     let stream_id_u64 = u64::from(send.id());
-    let buf = match recv.read_to_end(RPC_STREAM_READ_LIMIT).await {
-        Ok(buf) => buf,
+    // read_to_end returns Vec<u8>; freeze к Bytes once и slice through
+    // the dispatch path so handlers receive а ref-counted view с no
+    // further copying.
+    let buf: Bytes = match recv.read_to_end(RPC_STREAM_READ_LIMIT).await {
+        Ok(v) => Bytes::from(v),
         Err(e) => {
             debug!(remote = %remote, error = %e, "inbound RPC stream: read_to_end failed");
             return;
@@ -318,7 +322,7 @@ async fn handle_unary_stream(
     };
 
     match dispatch_unary(
-        &buf,
+        buf,
         connection.clone(),
         &registry,
         accept_instant,
@@ -343,27 +347,37 @@ async fn handle_unary_stream(
 
 /// Decode the request frame, look up the handler, invoke it, and
 /// return its bytes (or an [`RpcError`]).
+///
+/// The full-frame `buf` is owned here so we can slice the postcard
+/// payload as а zero-copy [`Bytes`] view that's handed to the handler.
 async fn dispatch_unary(
-    buf: &[u8],
+    buf: Bytes,
     connection: Connection,
     registry: &MethodRegistry,
     accept_instant: std::time::Instant,
     connection_id: u64,
     stream_id: u64,
-) -> RpcResult<Vec<u8>> {
-    let (opcode, rest) = buf
-        .split_first()
+) -> RpcResult<Bytes> {
+    let opcode = *buf
+        .first()
         .ok_or_else(|| RpcError::MalformedFrame("empty request frame".to_string()))?;
-    if *opcode != OPCODE_UNARY_REQUEST {
+    if opcode != OPCODE_UNARY_REQUEST {
         return Err(RpcError::MalformedFrame(format!(
             "expected unary-request opcode 0x{OPCODE_UNARY_REQUEST:02x}, got 0x{opcode:02x}",
         )));
     }
 
-    let (method_name, payload) = decode_method_name(rest)?;
+    // decode_method_name borrows from a &[u8] view of `buf`; we then
+    // measure how many bytes were consumed by the method-name prefix
+    // and slice the postcard payload as а zero-copy `Bytes`.
+    let (method_name, payload_slice) = decode_method_name(&buf[1..])?;
+    let method_name = method_name.to_string();
+    let consumed_prefix = buf.len() - payload_slice.len();
+    let payload = buf.slice(consumed_prefix..);
+
     let handler = registry
-        .lookup(method_name)
-        .ok_or_else(|| RpcError::UnknownMethod(method_name.to_string()))?;
+        .lookup(&method_name)
+        .ok_or(RpcError::UnknownMethod(method_name))?;
 
     // Frame fully decoded — capture decode duration before invoking the handler.
     let decode_duration = accept_instant.elapsed();
@@ -432,9 +446,9 @@ fn build_inbound_context(
 }
 
 /// Frame а success response: `[OPCODE_UNARY_RESPONSE | response_bytes]`.
-async fn write_response(send: &mut iroh::endpoint::SendStream, response: &[u8]) -> RpcResult<()> {
-    let mut buf = Vec::with_capacity(1 + response.len());
-    buf.push(OPCODE_UNARY_RESPONSE);
+async fn write_response(send: &mut iroh::endpoint::SendStream, response: &Bytes) -> RpcResult<()> {
+    let mut buf = BytesMut::with_capacity(1 + response.len());
+    buf.put_u8(OPCODE_UNARY_RESPONSE);
     buf.extend_from_slice(response);
     send.write_all(&buf)
         .await
@@ -458,8 +472,8 @@ async fn write_response(send: &mut iroh::endpoint::SendStream, response: &[u8]) 
 async fn write_error(send: &mut iroh::endpoint::SendStream, err: &RpcError) -> RpcResult<()> {
     let wire = WireError::from_rpc_error(err);
     let body_bytes = postcard::to_allocvec(&wire).map_err(RpcError::Codec)?;
-    let mut buf = Vec::with_capacity(1 + body_bytes.len());
-    buf.push(OPCODE_UNARY_ERROR);
+    let mut buf = BytesMut::with_capacity(1 + body_bytes.len());
+    buf.put_u8(OPCODE_UNARY_ERROR);
     buf.extend_from_slice(&body_bytes);
     send.write_all(&buf)
         .await
@@ -482,15 +496,12 @@ async fn write_error(send: &mut iroh::endpoint::SendStream, err: &RpcError) -> R
 /// Returns [`RpcError::MalformedFrame`] if the LEB128 length-prefix
 /// encoding fails (effectively never for an in-memory `Vec`, kept honest
 /// for forward-compat).
-pub(crate) fn build_unary_request_frame(
-    method_name: &str,
-    request_bytes: &[u8],
-) -> RpcResult<Vec<u8>> {
-    let mut buf = Vec::with_capacity(1 + 5 + method_name.len() + request_bytes.len());
+pub(crate) fn build_unary_request_frame(method_name: &str, request: &Bytes) -> RpcResult<Bytes> {
+    let mut buf = Vec::with_capacity(1 + 5 + method_name.len() + request.len());
     buf.push(OPCODE_UNARY_REQUEST);
     encode_method_name(method_name, &mut buf)?;
-    buf.extend_from_slice(request_bytes);
-    Ok(buf)
+    buf.extend_from_slice(request);
+    Ok(Bytes::from(buf))
 }
 
 #[cfg(test)]
@@ -499,8 +510,9 @@ mod tests {
 
     #[test]
     fn build_unary_request_frame_includes_opcode_name_and_payload() {
+        let payload = Bytes::from_static(b"PAYLOAD");
         let frame =
-            build_unary_request_frame("tolki:hello@1.0.0/test/echo", b"PAYLOAD").expect("frame");
+            build_unary_request_frame("tolki:hello@1.0.0/test/echo", &payload).expect("frame");
         assert_eq!(frame[0], OPCODE_UNARY_REQUEST);
         // Round-trip: skip opcode, parse method-name, payload should follow.
         let (name, rest) = decode_method_name(&frame[1..]).expect("decode");
@@ -510,7 +522,7 @@ mod tests {
 
     #[test]
     fn build_unary_request_frame_with_empty_payload() {
-        let frame = build_unary_request_frame("tolki:x@1.0.0/i/m", &[]).expect("frame");
+        let frame = build_unary_request_frame("tolki:x@1.0.0/i/m", &Bytes::new()).expect("frame");
         assert_eq!(frame[0], OPCODE_UNARY_REQUEST);
         let (name, rest) = decode_method_name(&frame[1..]).expect("decode");
         assert_eq!(name, "tolki:x@1.0.0/i/m");

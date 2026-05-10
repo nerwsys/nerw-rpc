@@ -12,6 +12,7 @@
 //!   — the server resolves к the latest registered semver under the same
 //!   `package/interface/method` triple.
 
+use bytes::Bytes;
 use iroh::EndpointId;
 use tracing::trace;
 
@@ -79,9 +80,9 @@ impl RpcClient {
         &self,
         peer: &EndpointId,
         method_name: &str,
-        request_bytes: &[u8],
-    ) -> RpcResult<Vec<u8>> {
-        let frame = build_unary_request_frame(method_name, request_bytes)?;
+        request: Bytes,
+    ) -> RpcResult<Bytes> {
+        let frame = build_unary_request_frame(method_name, &request)?;
         let (mut send, mut recv) = self
             .transport
             .inner()
@@ -94,7 +95,7 @@ impl RpcClient {
         trace!(
             peer = %peer,
             method = %method_name,
-            request_len = request_bytes.len(),
+            request_len = request.len(),
             "RpcClient::call - bidi opened, writing request",
         );
 
@@ -118,7 +119,7 @@ impl RpcClient {
                 reason: format!("read_to_end: {e}"),
             })?;
 
-        decode_response_frame(&response_buf)
+        decode_response_frame(&Bytes::from(response_buf))
     }
 }
 
@@ -130,14 +131,18 @@ impl RpcClient {
 /// is total: every wire variant maps к а concrete [`RpcError`] variant
 /// without ambiguity. Locale invariant — translating display strings
 /// в Russian (or anywhere else) does not affect classification.
-fn decode_response_frame(buf: &[u8]) -> RpcResult<Vec<u8>> {
-    let (opcode, rest) = buf
-        .split_first()
+///
+/// Takes the response frame by reference so the success path can
+/// `Bytes::slice` off the opcode byte without copying — the returned
+/// [`Bytes`] shares the same underlying allocation as `buf`.
+fn decode_response_frame(buf: &Bytes) -> RpcResult<Bytes> {
+    let opcode = *buf
+        .first()
         .ok_or_else(|| RpcError::MalformedFrame("empty response frame".to_string()))?;
-    match *opcode {
-        OPCODE_UNARY_RESPONSE => Ok(rest.to_vec()),
+    match opcode {
+        OPCODE_UNARY_RESPONSE => Ok(buf.slice(1..)),
         OPCODE_UNARY_ERROR => {
-            let wire: WireError = postcard::from_bytes(rest).map_err(RpcError::Codec)?;
+            let wire: WireError = postcard::from_bytes(&buf[1..]).map_err(RpcError::Codec)?;
             Err(wire.into_rpc_error())
         }
         other => Err(RpcError::MalformedFrame(format!(
@@ -151,24 +156,27 @@ mod tests {
     use super::*;
     use crate::wire::OPCODE_UNARY_REQUEST;
 
+    fn build_buf(prefix: u8, body: &[u8]) -> Bytes {
+        let mut v = Vec::with_capacity(1 + body.len());
+        v.push(prefix);
+        v.extend_from_slice(body);
+        Bytes::from(v)
+    }
+
     #[test]
     fn decode_response_frame_success() {
-        let mut buf = Vec::new();
-        buf.push(OPCODE_UNARY_RESPONSE);
-        buf.extend_from_slice(b"OK-PAYLOAD");
+        let buf = build_buf(OPCODE_UNARY_RESPONSE, b"OK-PAYLOAD");
         let decoded = decode_response_frame(&buf).expect("decode ok");
-        assert_eq!(decoded, b"OK-PAYLOAD");
+        assert_eq!(&decoded[..], b"OK-PAYLOAD");
     }
 
     #[test]
     fn decode_response_frame_error_handler() {
-        let mut buf = Vec::new();
-        buf.push(OPCODE_UNARY_ERROR);
         let body = postcard::to_allocvec(&WireError::HandlerError {
             display: "some handler failure".to_string(),
         })
         .expect("encode");
-        buf.extend_from_slice(&body);
+        let buf = build_buf(OPCODE_UNARY_ERROR, &body);
         let err = decode_response_frame(&buf).expect_err("must error");
         match err {
             RpcError::Handler(_) => {}
@@ -178,13 +186,11 @@ mod tests {
 
     #[test]
     fn decode_response_frame_error_unknown_method() {
-        let mut buf = Vec::new();
-        buf.push(OPCODE_UNARY_ERROR);
         let body = postcard::to_allocvec(&WireError::UnknownMethod {
             method_name: "tolki:nope@1.0.0/iface/method".to_string(),
         })
         .expect("encode");
-        buf.extend_from_slice(&body);
+        let buf = build_buf(OPCODE_UNARY_ERROR, &body);
         let err = decode_response_frame(&buf).expect_err("must error");
         match err {
             RpcError::UnknownMethod(name) => {
@@ -199,14 +205,12 @@ mod tests {
         // Demonstrates the new typed wire format preserves variant + metadata
         // even when the human-readable Display would not survive а string-prefix
         // match (e.g. translated к Russian).
-        let mut buf = Vec::new();
-        buf.push(OPCODE_UNARY_ERROR);
         let body = postcard::to_allocvec(&WireError::VersionMismatch {
             requested: "9.9.9".to_string(),
             available: vec!["1.0.0".to_string(), "2.0.0".to_string()],
         })
         .expect("encode");
-        buf.extend_from_slice(&body);
+        let buf = build_buf(OPCODE_UNARY_ERROR, &body);
         let err = decode_response_frame(&buf).expect_err("must error");
         match err {
             RpcError::VersionMismatch {
@@ -222,13 +226,13 @@ mod tests {
 
     #[test]
     fn decode_response_frame_empty_buffer() {
-        let err = decode_response_frame(&[]).expect_err("empty buffer must error");
+        let err = decode_response_frame(&Bytes::new()).expect_err("empty buffer must error");
         assert!(matches!(err, RpcError::MalformedFrame(_)));
     }
 
     #[test]
     fn decode_response_frame_unexpected_opcode() {
-        let buf = vec![OPCODE_UNARY_REQUEST, 0xAA, 0xBB];
+        let buf = build_buf(OPCODE_UNARY_REQUEST, &[0xAA, 0xBB]);
         let err = decode_response_frame(&buf).expect_err("must error");
         let s = err.to_string();
         assert!(s.contains("unexpected response opcode"));

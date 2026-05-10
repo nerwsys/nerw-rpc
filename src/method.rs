@@ -13,6 +13,7 @@
 use crate::context::RpcContext;
 use crate::error::RpcResult;
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -24,12 +25,21 @@ use std::sync::Arc;
 /// returns postcard-encoded response bytes (or an [`crate::error::RpcError`]
 /// — typically wrapping a domain error in [`crate::error::RpcError::Handler`]).
 ///
+/// ## Why `Bytes`, not `&[u8]` / `Vec<u8>`
+///
+/// Both the request body (read off the wire) и the response body (written
+/// back to the wire) are `Bytes` — а ref-counted buffer that supports
+/// zero-copy slicing. Handlers that need к hand the bytes к а codec
+/// (postcard-decode, sub-slice etc.) clone cheaply без allocation.
+/// Returning [`bytes::Bytes`] lets the framework write directly into the
+/// outbound QUIC stream без copying through а `Vec`.
+///
 /// Codec calls live at the caller boundary, not inside the handler trait,
 /// so the registry stays generic over arbitrary request/response shapes.
 #[async_trait]
 pub trait MethodHandler: Send + Sync + 'static {
     /// Handle a request — bytes in, bytes out.
-    async fn handle(&self, ctx: RpcContext, request_bytes: &[u8]) -> RpcResult<Vec<u8>>;
+    async fn handle(&self, ctx: RpcContext, request: Bytes) -> RpcResult<Bytes>;
 }
 
 /// Parsed canonical method name `package[@version]/interface/method`.
@@ -238,8 +248,9 @@ mod tests {
 
     #[async_trait]
     impl MethodHandler for EchoHandler {
-        async fn handle(&self, _ctx: RpcContext, request_bytes: &[u8]) -> RpcResult<Vec<u8>> {
-            Ok(request_bytes.to_vec())
+        async fn handle(&self, _ctx: RpcContext, request: Bytes) -> RpcResult<Bytes> {
+            // Bytes is Clone (ref-count bump) — no allocation on echo path.
+            Ok(request)
         }
     }
 
@@ -280,8 +291,11 @@ mod tests {
     async fn handler_invocation_roundtrip() {
         let h: Arc<dyn MethodHandler> = Arc::new(EchoHandler);
         let ctx = RpcContext::minimal(PeerMetadata::loopback());
-        let out = h.handle(ctx, b"hello").await.expect("handler ok");
-        assert_eq!(out, b"hello");
+        let out = h
+            .handle(ctx, Bytes::from_static(b"hello"))
+            .await
+            .expect("handler ok");
+        assert_eq!(&out[..], b"hello");
     }
 
     #[test]

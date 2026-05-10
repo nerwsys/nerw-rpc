@@ -34,6 +34,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use parking_lot::Mutex;
 use tracing::trace;
 
@@ -48,6 +49,10 @@ use crate::transport::ALPN_TOLKI_DATAGRAM_1_0_0;
 /// payload bytes (everything после the leading token byte). Handlers
 /// MUST return promptly — the dispatcher's caller drives the inbound
 /// datagram broadcast loop, и slow handlers can starve other tokens.
+///
+/// `payload` is а [`Bytes`] view sharing the same underlying allocation
+/// as the inbound datagram — handlers can clone it cheaply (ref-count
+/// bump) к hand off к downstream channels без copying.
 #[async_trait]
 pub trait DatagramHandler: Send + Sync + 'static {
     /// Process one inbound datagram payload.
@@ -57,7 +62,7 @@ pub trait DatagramHandler: Send + Sync + 'static {
     /// Implementation-defined. Errors are logged at the dispatcher
     /// level и do not propagate (datagram traffic is fire-and-forget;
     /// the sender does not wait for an ack).
-    async fn handle(&self, ctx: RpcContext, payload: &[u8]) -> RpcResult<()>;
+    async fn handle(&self, ctx: RpcContext, payload: Bytes) -> RpcResult<()>;
 }
 
 /// Number of token slots — one per possible byte value (`0..=255`).
@@ -154,27 +159,32 @@ impl DatagramDispatcher {
 
     /// Dispatch one inbound datagram frame: `[token | payload]`.
     ///
+    /// `frame` is taken as а [`Bytes`] so the payload slice handed к
+    /// the handler shares the inbound allocation (zero-copy split-off
+    /// of the leading token byte).
+    ///
     /// # Errors
     ///
     /// - [`RpcError::DatagramTooShort`] — `frame.is_empty()` (no token byte).
     /// - [`RpcError::DatagramTokenUnknown`] — slot has no registered handler.
     /// - Any error returned by the handler itself.
-    pub async fn dispatch(&self, ctx: RpcContext, frame: &[u8]) -> RpcResult<()> {
-        let (token, payload) = frame
-            .split_first()
+    pub async fn dispatch(&self, ctx: RpcContext, frame: Bytes) -> RpcResult<()> {
+        let token = *frame
+            .first()
             .ok_or(RpcError::DatagramTooShort { len: frame.len() })?;
+        let payload = frame.slice(1..);
 
         // Scoped lock — clone the Arc и drop the lock BEFORE awaiting
         // the handler. Holding а sync mutex across .await is а foot-gun
         // (deadlock with tokio runtimes that have один worker thread).
         let handler = {
             let slots = self.slots.lock();
-            slots[usize::from(*token)].clone()
+            slots[usize::from(token)].clone()
         };
 
         match handler {
             Some(h) => h.handle(ctx, payload).await,
-            None => Err(RpcError::DatagramTokenUnknown { token: *token }),
+            None => Err(RpcError::DatagramTokenUnknown { token }),
         }
     }
 
@@ -239,7 +249,7 @@ mod tests {
 
     #[async_trait]
     impl DatagramHandler for CountingHandler {
-        async fn handle(&self, _ctx: RpcContext, payload: &[u8]) -> RpcResult<()> {
+        async fn handle(&self, _ctx: RpcContext, payload: Bytes) -> RpcResult<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_payload.lock() = payload.to_vec();
             Ok(())
@@ -286,9 +296,15 @@ mod tests {
         d.register(2, h_b.clone()).expect("register B");
 
         let ctx = RpcContext::minimal(PeerMetadata::loopback());
-        d.dispatch(ctx.clone(), &[1, 0xAA, 0xBB]).await.expect("A");
-        d.dispatch(ctx.clone(), &[2, 0xCC]).await.expect("B");
-        d.dispatch(ctx, &[1, 0xDD, 0xEE, 0xFF]).await.expect("A");
+        d.dispatch(ctx.clone(), Bytes::from_static(&[1, 0xAA, 0xBB]))
+            .await
+            .expect("A");
+        d.dispatch(ctx.clone(), Bytes::from_static(&[2, 0xCC]))
+            .await
+            .expect("B");
+        d.dispatch(ctx, Bytes::from_static(&[1, 0xDD, 0xEE, 0xFF]))
+            .await
+            .expect("A");
 
         assert_eq!(h_a.call_count(), 2);
         assert_eq!(h_b.call_count(), 1);
@@ -301,7 +317,7 @@ mod tests {
         let d = DatagramDispatcher::new();
         let ctx = RpcContext::minimal(PeerMetadata::loopback());
         let err = d
-            .dispatch(ctx, &[100, 0xAA])
+            .dispatch(ctx, Bytes::from_static(&[100, 0xAA]))
             .await
             .expect_err("unknown token must error");
         match err {
@@ -315,7 +331,7 @@ mod tests {
         let d = DatagramDispatcher::new();
         let ctx = RpcContext::minimal(PeerMetadata::loopback());
         let err = d
-            .dispatch(ctx, &[])
+            .dispatch(ctx, Bytes::new())
             .await
             .expect_err("empty frame must error");
         match err {

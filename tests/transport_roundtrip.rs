@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use bytes::Bytes;
 use iroh::{EndpointAddr, TransportAddr};
 use nerw_core::client::{Client, ClientConfig};
 use nerw_core::protocol::ALPN_NERW_RPC;
@@ -99,8 +100,8 @@ struct EchoMethodHandler;
 
 #[async_trait]
 impl MethodHandler for EchoMethodHandler {
-    async fn handle(&self, _ctx: RpcContext, request_bytes: &[u8]) -> RpcResult<Vec<u8>> {
-        Ok(request_bytes.to_vec())
+    async fn handle(&self, _ctx: RpcContext, request: Bytes) -> RpcResult<Bytes> {
+        Ok(request)
     }
 }
 
@@ -113,8 +114,8 @@ struct TagHandler {
 
 #[async_trait]
 impl MethodHandler for TagHandler {
-    async fn handle(&self, _ctx: RpcContext, _request_bytes: &[u8]) -> RpcResult<Vec<u8>> {
-        Ok(self.tag.as_bytes().to_vec())
+    async fn handle(&self, _ctx: RpcContext, _request: Bytes) -> RpcResult<Bytes> {
+        Ok(Bytes::from_static(self.tag.as_bytes()))
     }
 }
 
@@ -173,14 +174,19 @@ async fn unary_rpc_roundtrip() -> Result<()> {
     let bravo_id = fix.bravo_transport.node_id();
     let response = timeout(
         Duration::from_secs(15),
-        client.call(&bravo_id, "test:hello@1.0.0/test/echo", b"PAYLOAD"),
+        client.call(
+            &bravo_id,
+            "test:hello@1.0.0/test/echo",
+            Bytes::from_static(b"PAYLOAD"),
+        ),
     )
     .await
     .context("call timed out")?
     .context("call returned an error")?;
 
     assert_eq!(
-        response, b"PAYLOAD",
+        &response[..],
+        b"PAYLOAD",
         "echo handler must round-trip the request bytes",
     );
     Ok(())
@@ -210,22 +216,30 @@ async fn version_omitted_resolves_to_latest() -> Result<()> {
     // Call с the version OMITTED — must resolve к v2 (largest semver).
     let response = timeout(
         Duration::from_secs(15),
-        client.call(&bravo_id, "test:hello/test/version", b""),
+        client.call(&bravo_id, "test:hello/test/version", Bytes::new()),
     )
     .await
     .context("call timed out")?
     .context("call errored")?;
-    assert_eq!(response, b"v2", "omitted version must pick latest semver");
+    assert_eq!(
+        &response[..],
+        b"v2",
+        "omitted version must pick latest semver"
+    );
 
     // Pinned 1.0.0 still works.
     let response_v1 = timeout(
         Duration::from_secs(15),
-        client.call(&bravo_id, "test:hello@1.0.0/test/version", b""),
+        client.call(&bravo_id, "test:hello@1.0.0/test/version", Bytes::new()),
     )
     .await
     .context("v1 call timed out")?
     .context("v1 call errored")?;
-    assert_eq!(response_v1, b"v1", "pinned 1.0.0 must still hit v1 handler");
+    assert_eq!(
+        &response_v1[..],
+        b"v1",
+        "pinned 1.0.0 must still hit v1 handler"
+    );
 
     Ok(())
 }
@@ -247,7 +261,11 @@ async fn unknown_method_returns_typed_error() -> Result<()> {
 
     let err = timeout(
         Duration::from_secs(15),
-        client.call(&bravo_id, "test:nonexistent@1.0.0/iface/method", b"PAYLOAD"),
+        client.call(
+            &bravo_id,
+            "test:nonexistent@1.0.0/iface/method",
+            Bytes::from_static(b"PAYLOAD"),
+        ),
     )
     .await
     .context("call timed out")?
@@ -270,7 +288,7 @@ struct RecordingDatagramHandler {
 
 #[async_trait]
 impl DatagramHandler for RecordingDatagramHandler {
-    async fn handle(&self, _ctx: RpcContext, payload: &[u8]) -> RpcResult<()> {
+    async fn handle(&self, _ctx: RpcContext, payload: Bytes) -> RpcResult<()> {
         self.received.lock().await.push(payload.to_vec());
         self.notify.notify_one();
         Ok(())
@@ -303,8 +321,9 @@ async fn datagram_dispatch_roundtrip() -> Result<()> {
         while let Ok(frame) = rx.recv().await {
             let ctx = DatagramDispatcher::build_context(frame.from_peer);
             // Errors are логированы by the dispatcher; tests assert
-            // via the recorded buffer.
-            let _ = dispatcher_loop.dispatch(ctx, &frame.payload).await;
+            // via the recorded buffer.  frame.payload is already Bytes;
+            // .clone() bumps the ref-count, no allocation.
+            let _ = dispatcher_loop.dispatch(ctx, frame.payload.clone()).await;
         }
     });
 
