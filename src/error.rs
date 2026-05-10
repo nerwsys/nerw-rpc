@@ -113,9 +113,7 @@ pub enum RpcError {
 
     /// Inbound datagram was empty — there are no bytes к decode the
     /// `varint(stream-id)` prefix from.
-    #[error(
-        "datagram: too short ({len} bytes), need at least 1 byte for varint stream-id prefix"
-    )]
+    #[error("datagram: too short ({len} bytes), need at least 1 byte for varint stream-id prefix")]
     DatagramTooShort {
         /// Actual length of the malformed datagram.
         len: usize,

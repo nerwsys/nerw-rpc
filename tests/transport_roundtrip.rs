@@ -17,9 +17,10 @@
 //!    not registered; the framework returns
 //!    [`nerw_rpc::RpcError::UnknownMethod`] cleanly.
 //! 4. **Datagram dispatch** — server registers а
-//!    [`nerw_rpc::DatagramHandler`] at token 42; client sends а
-//!    datagram с the token prefix; server's broadcast loop dispatches
-//!    к the handler and observes the payload.
+//!    [`nerw_rpc::DatagramHandler`] under а handshake stream-id; client
+//!    sends а datagram с а matching `varint(stream-id)` prefix;
+//!    server's broadcast loop dispatches к the handler и observes
+//!    the payload.
 //!
 //! TLS strategy mirrors `nerw_core/tests/stream_control_smoke.rs`:
 //! rcgen generates а fresh self-signed CA per test run и pins it via
@@ -40,7 +41,7 @@ use nerw_core::protocol::ALPN_NERW_RPC;
 use nerw_rpc::{
     ALPN_TOLKI_DATAGRAM_2_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, DatagramDispatcher, DatagramHandler,
     IrohTransportClient, MethodHandler, MethodRegistry, RpcClient, RpcContext, RpcError, RpcResult,
-    RpcServer, RpcServerConfig,
+    RpcServer, RpcServerConfig, wire::encode_stream_id,
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -297,9 +298,15 @@ impl DatagramHandler for RecordingDatagramHandler {
 
 #[tokio::test]
 async fn datagram_dispatch_roundtrip() -> Result<()> {
+    // Bravo: dispatcher с handler keyed by handshake stream-id 42.
+    // In production code, the stream-id is the QUIC stream-id of the
+    // bidi handshake stream that established the voice session; here
+    // we mock it as а constant since the test does not perform an
+    // actual handshake (the dispatch surface itself is what we exercise).
+    const HANDSHAKE_STREAM_ID: u64 = 42;
+
     let (fix, _tmp_a, _tmp_b) = build_duo("dg-alpha", "dg-bravo").await?;
 
-    // Bravo: dispatcher с handler at token 42.
     let dispatcher = Arc::new(DatagramDispatcher::new());
     let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
     let notify = Arc::new(tokio::sync::Notify::new());
@@ -307,7 +314,9 @@ async fn datagram_dispatch_roundtrip() -> Result<()> {
         received: Arc::clone(&received),
         notify: Arc::clone(&notify),
     });
-    dispatcher.register(42, handler).expect("register");
+    dispatcher
+        .register(HANDSHAKE_STREAM_ID, handler)
+        .expect("register");
 
     // Spawn а subscriber loop that reads from bravo's datagram broadcast
     // и dispatches к the table. Must subscribe BEFORE alpha sends so
@@ -327,26 +336,22 @@ async fn datagram_dispatch_roundtrip() -> Result<()> {
         }
     });
 
-    // Alpha: send а datagram с token prefix [42 | "RTP-FRAME"].
-    // We use the nerw-core send_datagram surface; the "agent_name" is
-    // the routing prefix at the nerw-mesh layer (8B BLAKE3) — distinct
-    // from our application-level 1-byte token. We pick "bravo" as the
-    // mesh-layer routing tag; both peers share а connection so the
-    // datagram lands.
+    // Alpha: send а datagram с varint(stream-id) prefix:
+    // [varint(42) | "RTP-FRAME"]. We use the nerw-core send_datagram
+    // surface; the "agent_name" is the routing prefix at the
+    // nerw-mesh layer (8B BLAKE3) — distinct from our application-level
+    // varint(stream-id) prefix. We pick "bravo" as the mesh-layer
+    // routing tag; both peers share а connection so the datagram lands.
     let alpha_inner = Arc::clone(fix.alpha_transport.inner());
     let bravo_id = fix.bravo_transport.node_id();
     let mut payload = Vec::new();
-    payload.push(42u8);
+    encode_stream_id(HANDSHAKE_STREAM_ID, &mut payload).expect("encode stream-id");
     payload.extend_from_slice(b"RTP-FRAME");
 
     // Datagrams require а pre-existing nerw-rpc connection to be cached
     // because nerw-core piggybacks on the ALPN_NERW_RPC connection.
-    // Trigger one with а quick send_to_peer-equivalent: the simplest
-    // way is к open а bidi (which fails because no handler registered
-    // for ALPN_NERW_RPC custom ALPN, но the connection IS cached).
-    // Actually nerw-core's send_datagram itself establishes the
-    // connection if missing — see Client::get_or_connect_for_datagrams.
-    // So we can just call it directly.
+    // nerw-core's send_datagram establishes the connection if missing
+    // — see Client::get_or_connect_for_datagrams.
     timeout(
         Duration::from_secs(15),
         alpha_inner.send_datagram(&bravo_id, "bravo", &payload),
@@ -364,12 +369,136 @@ async fn datagram_dispatch_roundtrip() -> Result<()> {
     assert_eq!(recorded.len(), 1, "exactly one frame should have arrived");
     assert_eq!(
         recorded[0], b"RTP-FRAME",
-        "handler must observe the payload AFTER the token byte",
+        "handler must observe the payload AFTER the varint(stream-id) prefix",
     );
     drop(recorded);
 
     task.abort();
     Ok(())
+}
+
+/// Datagram correlation tests — verify the dispatcher's stream-id
+/// keyed surface integrates cleanly с the transport layer.
+///
+/// Pure unit-level concerns (collision detection, idempotent
+/// unregister, varint encode/decode) are also exercised inline в
+/// `src/datagram.rs::tests` и `src/wire.rs::tests`; the integration
+/// tests here verify the SAME behaviour at the broadcast-loop level
+/// where real datagrams arrive.
+#[tokio::test]
+async fn datagram_handshake_correlation_roundtrip() -> Result<()> {
+    // Verify the WebTransport-style correlation contract end-to-end:
+    // dispatcher registers а handler under а handshake stream-id и
+    // routes datagrams carrying а matching varint(stream-id) prefix
+    // к that handler. We use а large stream-id (1_000_000) to exercise
+    // the multi-byte varint path that the legacy 1-byte token could
+    // not represent.
+    const HANDSHAKE_STREAM_ID: u64 = 1_000_000;
+    let (fix, _tmp_a, _tmp_b) = build_duo("hcorr-alpha", "hcorr-bravo").await?;
+
+    let dispatcher = Arc::new(DatagramDispatcher::new());
+    let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let handler = Arc::new(RecordingDatagramHandler {
+        received: Arc::clone(&received),
+        notify: Arc::clone(&notify),
+    });
+    dispatcher
+        .register(HANDSHAKE_STREAM_ID, handler)
+        .expect("register");
+
+    let bravo_inner = Arc::clone(fix.bravo_transport.inner());
+    let dispatcher_loop = Arc::clone(&dispatcher);
+    let mut rx = bravo_inner.subscribe_datagrams();
+    let task = tokio::spawn(async move {
+        while let Ok(frame) = rx.recv().await {
+            let ctx = DatagramDispatcher::build_context(frame.from_peer);
+            let _ = dispatcher_loop.dispatch(ctx, frame.payload.clone()).await;
+        }
+    });
+
+    // [varint(1_000_000) | "VOICE-FRAME"]
+    let alpha_inner = Arc::clone(fix.alpha_transport.inner());
+    let bravo_id = fix.bravo_transport.node_id();
+    let mut payload = Vec::new();
+    encode_stream_id(HANDSHAKE_STREAM_ID, &mut payload).expect("encode stream-id");
+    payload.extend_from_slice(b"VOICE-FRAME");
+
+    timeout(
+        Duration::from_secs(15),
+        alpha_inner.send_datagram(&bravo_id, "bravo", &payload),
+    )
+    .await
+    .context("send_datagram timed out")?
+    .context("send_datagram errored")?;
+
+    timeout(Duration::from_secs(10), notify.notified())
+        .await
+        .context("handler never received the datagram within 10s")?;
+
+    let recorded = received.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0], b"VOICE-FRAME",
+        "handler must observe payload after the varint(stream-id) prefix"
+    );
+    drop(recorded);
+
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn datagram_stream_id_collision_rejected() {
+    // Pure unit-level surface — exercised through the public dispatcher
+    // API без needing а transport. Mirrors src/datagram.rs::tests::
+    // register_collision_errors but with the integration-test naming
+    // scheme so the suite reads cohesively.
+    let dispatcher = DatagramDispatcher::new();
+    let h1 = Arc::new(RecordingDatagramHandler {
+        received: Arc::new(Mutex::new(Vec::new())),
+        notify: Arc::new(tokio::sync::Notify::new()),
+    });
+    let h2 = Arc::new(RecordingDatagramHandler {
+        received: Arc::new(Mutex::new(Vec::new())),
+        notify: Arc::new(tokio::sync::Notify::new()),
+    });
+    dispatcher.register(42, h1).expect("first register");
+
+    let err = dispatcher
+        .register(42, h2)
+        .expect_err("second register at same stream-id must error");
+    match err {
+        RpcError::DatagramStreamIdCollision { stream_id } => assert_eq!(stream_id, 42),
+        other => panic!("expected DatagramStreamIdCollision, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn datagram_stream_id_unregister_idempotent() {
+    // Unregistering а never-registered stream-id is а silent no-op;
+    // calling it twice (or on а fresh dispatcher) MUST NOT panic.
+    let dispatcher = DatagramDispatcher::new();
+    assert!(dispatcher.unregister(9999).is_none());
+    assert!(
+        dispatcher.unregister(9999).is_none(),
+        "second unregister must stay idempotent"
+    );
+
+    // Register-then-unregister-twice — second unregister sees None.
+    let h = Arc::new(RecordingDatagramHandler {
+        received: Arc::new(Mutex::new(Vec::new())),
+        notify: Arc::new(tokio::sync::Notify::new()),
+    });
+    dispatcher.register(7, h).expect("register");
+    assert!(
+        dispatcher.unregister(7).is_some(),
+        "first unregister returns the previous handler"
+    );
+    assert!(
+        dispatcher.unregister(7).is_none(),
+        "second unregister of the same id is а no-op"
+    );
 }
 
 // =============================================================================
@@ -379,7 +508,7 @@ async fn datagram_dispatch_roundtrip() -> Result<()> {
 //  - malformed inbound bytes (server stays alive, returns MalformedFrame)
 //  - handler-returned errors (client decodes RpcError::Handler)
 //  - large payloads (1 MiB roundtrip stays within 8 MiB read limit)
-//  - datagram unknown tokens (DatagramTokenUnknown surfaced)
+//  - datagram unknown stream-ids (DatagramStreamIdUnknown surfaced)
 //  - bounded concurrent streams (Semaphore enforces max_concurrent_streams)
 // =============================================================================
 
@@ -660,15 +789,18 @@ async fn large_payload_1mb_roundtrip() -> Result<()> {
 }
 
 #[tokio::test]
-async fn datagram_unknown_token_observable() -> Result<()> {
-    // The datagram dispatcher's behaviour on an unregistered token is а
-    // unit-tested concern (see datagram::tests::dispatch_unknown_token_errors),
-    // but we want к verify it integrates cleanly с the broadcast-loop
-    // path used by real datagram traffic.
-    let (fix, _tmp_a, _tmp_b) = build_duo("unk-tok-alpha", "unk-tok-bravo").await?;
+async fn datagram_unknown_stream_id_observable() -> Result<()> {
+    // The datagram dispatcher's behaviour on an unregistered stream-id
+    // is а unit-tested concern (see datagram::tests::
+    // dispatch_unknown_stream_id_errors), but we want к verify it
+    // integrates cleanly с the broadcast-loop path used by real
+    // datagram traffic.
+    // Stream-id 99 is intentionally NOT registered.
+    const GHOST_STREAM_ID: u64 = 99;
+
+    let (fix, _tmp_a, _tmp_b) = build_duo("unk-sid-alpha", "unk-sid-bravo").await?;
 
     let dispatcher = Arc::new(DatagramDispatcher::new());
-    // Token 99 is intentionally NOT registered.
 
     let bravo_inner = Arc::clone(fix.bravo_transport.inner());
     let dispatcher_loop = Arc::clone(&dispatcher);
@@ -678,8 +810,8 @@ async fn datagram_unknown_token_observable() -> Result<()> {
     let task = tokio::spawn(async move {
         if let Ok(frame) = rx.recv().await {
             let ctx = DatagramDispatcher::build_context(frame.from_peer);
-            // Dispatch must return DatagramTokenUnknown — observable via
-            // the returned error, not silently swallowed.
+            // Dispatch must return DatagramStreamIdUnknown — observable
+            // via the returned error, not silently swallowed.
             let r = dispatcher_loop.dispatch(ctx, frame.payload.clone()).await;
             if let Err(e) = r {
                 observed_clone.lock().await.push(e);
@@ -687,11 +819,11 @@ async fn datagram_unknown_token_observable() -> Result<()> {
         }
     });
 
-    // Send а datagram с token=99 (unregistered).
+    // Send а datagram с varint(stream-id=99) prefix (unregistered).
     let alpha_inner = Arc::clone(fix.alpha_transport.inner());
     let bravo_id = fix.bravo_transport.node_id();
     let mut payload = Vec::new();
-    payload.push(99u8);
+    encode_stream_id(GHOST_STREAM_ID, &mut payload).expect("encode stream-id");
     payload.extend_from_slice(b"GHOST-FRAME");
     timeout(
         Duration::from_secs(15),
@@ -708,11 +840,11 @@ async fn datagram_unknown_token_observable() -> Result<()> {
     assert_eq!(
         errors.len(),
         1,
-        "exactly one DatagramTokenUnknown error must be observable",
+        "exactly one DatagramStreamIdUnknown error must be observable",
     );
     match &errors[0] {
-        RpcError::DatagramTokenUnknown { token } => assert_eq!(*token, 99),
-        other => panic!("expected DatagramTokenUnknown, got {other:?}"),
+        RpcError::DatagramStreamIdUnknown { stream_id } => assert_eq!(*stream_id, GHOST_STREAM_ID),
+        other => panic!("expected DatagramStreamIdUnknown, got {other:?}"),
     }
     drop(errors);
     task.abort();

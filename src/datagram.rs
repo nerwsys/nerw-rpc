@@ -143,11 +143,7 @@ impl DatagramDispatcher {
     /// Returns [`RpcError::DatagramStreamIdCollision`] if а handler is
     /// already registered for the same stream-id. Use
     /// [`Self::unregister`] first if you need к replace.
-    pub fn register(
-        &self,
-        stream_id: u64,
-        handler: Arc<dyn DatagramHandler>,
-    ) -> RpcResult<()> {
+    pub fn register(&self, stream_id: u64, handler: Arc<dyn DatagramHandler>) -> RpcResult<()> {
         // DashMap::entry returns either Vacant or Occupied. Using `entry`
         // ensures the check-and-insert is atomic against concurrent
         // registrations on the same shard.
@@ -223,7 +219,10 @@ impl DatagramDispatcher {
         // Lookup, clone Arc, drop the DashMap guard BEFORE awaiting
         // the handler. Holding а sync guard across .await is а foot-gun
         // (deadlock with tokio runtimes that have один worker thread).
-        let handler = self.handlers.get(&stream_id).map(|entry| Arc::clone(&entry));
+        let handler = self
+            .handlers
+            .get(&stream_id)
+            .map(|entry| Arc::clone(&entry));
 
         match handler {
             Some(h) => h.handle(ctx, payload).await,
