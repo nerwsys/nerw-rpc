@@ -185,7 +185,7 @@ mod tests {
     fn datagram_token_unknown_displays_token() {
         let err = RpcError::DatagramTokenUnknown { token: 7 };
         let s = err.to_string();
-        assert!(s.contains("7"));
+        assert!(s.contains('7'));
         assert!(s.contains("not registered"));
     }
 
