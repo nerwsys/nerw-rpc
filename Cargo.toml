@@ -22,6 +22,14 @@ uuid = { version = "1.7", features = ["v4", "serde"] }
 async-trait = "0.1"
 
 # Phase 2 — iroh transport binding (path dep к local nerw-core checkout).
+#
+# Caret semver pin (`"0.98"` matches `>=0.98.0, <0.99.0`) is acceptable
+# during workspace development — Cargo.lock anchors the exact resolved
+# version, and our nerw-core path-dep already locks к а specific iroh
+# minor.  Когда nerw-rpc ships к crates.io, switch к an exact pin
+# (`= "0.98.x"`) matching nerw-core's locked iroh version, so consumers
+# of the published crate cannot accidentally pull а semver-incompatible
+# iroh patch into the same dependency tree.
 iroh = "0.98"
 nerw-core = { path = "/src/nerw/crates/nerw-core" }
 parking_lot = "0.12"
