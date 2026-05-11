@@ -178,7 +178,8 @@ impl WireError {
                 // server-side prefix so the client renders а single prefix.
                 let inner = display
                     .strip_prefix("handler error: ")
-                    .unwrap_or(&display).to_owned();
+                    .unwrap_or(&display)
+                    .to_owned();
                 RpcError::Handler(inner.into())
             }
             Self::Codec { display } => {

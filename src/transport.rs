@@ -128,6 +128,8 @@ pub const NERW_RPC_ALPNS: &[&[u8]] = &[
 /// [`nerw_core::client::Client::shutdown`] at process exit.
 #[derive(Debug, Clone)]
 pub struct IrohTransportClient {
+    /// Shared owner of the iroh endpoint + accept loop. `Arc` makes
+    /// [`IrohTransportClient`] cheap к clone across spawned tasks.
     inner: Arc<nerw_core::client::Client>,
 }
 

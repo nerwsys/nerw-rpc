@@ -1,4 +1,6 @@
-//! [`RpcServer`] — registers an [`nerw_core::client::AlpnHandler`] for
+//! [`RpcServer`] — the inbound-side of nerw-rpc.
+//!
+//! Registers an [`nerw_core::client::AlpnHandler`] for
 //! [`crate::transport::ALPN_TOLKI_WIRE_PROTOCOL_2_0_0`] and dispatches
 //! inbound bidi streams к а shared [`crate::method::MethodRegistry`].
 //!
@@ -111,8 +113,13 @@ impl Default for RpcServerConfig {
 /// once at startup к register the inbound handler с nerw-core's
 /// accept loop.
 pub struct RpcServer {
+    /// Iroh-backed transport handle shared with the accept loop.
     transport: IrohTransportClient,
+    /// Per-method handler registry populated by application code at
+    /// startup. `Arc` because the accept loop spawns one task per
+    /// connection and each task needs а cheap clone.
     registry: Arc<MethodRegistry>,
+    /// Concurrency limits + timeout configuration (see [`RpcServerConfig`]).
     config: RpcServerConfig,
 }
 
@@ -209,6 +216,7 @@ impl RpcServer {
 /// inbound connection. The trait method `handle` is sync — we spawn the
 /// async work onto the ambient tokio runtime.
 struct WireDispatchHandler {
+    /// Shared handler lookup table populated by application code.
     registry: Arc<MethodRegistry>,
     /// Caps concurrent stream-handler tasks across all connections.
     /// Each accepted bidi acquires а permit; tasks blocked on the

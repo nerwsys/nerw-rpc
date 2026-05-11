@@ -40,6 +40,8 @@ const RPC_RESPONSE_READ_LIMIT: usize = 8 * 1024 * 1024;
 /// hood. Multiple concurrent calls share the same connection cache.
 #[derive(Debug, Clone)]
 pub struct RpcClient {
+    /// Iroh-backed transport handle. Cloning is cheap (`Arc` inside);
+    /// concurrent calls share the same connection cache.
     transport: IrohTransportClient,
 }
 

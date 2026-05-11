@@ -106,10 +106,10 @@ impl MethodName {
     /// Reconstruct the canonical text representation.
     #[must_use]
     pub fn to_canonical(&self) -> String {
-        match &self.version {
-            Some(v) => format!("{}@{}/{}/{}", self.package, v, self.interface, self.method),
-            None => format!("{}/{}/{}", self.package, self.interface, self.method),
-        }
+        self.version.as_ref().map_or_else(
+            || format!("{}/{}/{}", self.package, self.interface, self.method),
+            |v| format!("{}@{}/{}/{}", self.package, v, self.interface, self.method),
+        )
     }
 }
 
@@ -125,6 +125,10 @@ impl MethodName {
 /// upgrade the resolver to use a real semver parser.
 #[derive(Default)]
 pub struct MethodRegistry {
+    /// Canonical-name keyed handler map. Key is the fully-qualified
+    /// `package@version/interface/method` string. Versioned and
+    /// version-omitted lookups both index into this single map (see
+    /// [`MethodRegistry::lookup`] для resolution rules).
     handlers: HashMap<String, Arc<dyn MethodHandler>>,
 }
 
