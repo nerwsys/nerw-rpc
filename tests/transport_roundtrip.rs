@@ -1,4 +1,15 @@
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(
+    // Assertions in tests are explicit by design.
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    // `_ => panic!(...)` is the idiomatic narrow-variant assertion form;
+    // listing every variant adds noise without trust-boundary value.
+    clippy::wildcard_enum_match_arm,
+    // Numeric literal defaults are fine in tests — no wire/disk format
+    // depends on these values.
+    clippy::default_numeric_fallback,
+)]
 
 //! End-to-end nerw-rpc Phase 2 integration tests.
 //!
@@ -717,7 +728,7 @@ struct ErroringHandler;
 impl MethodHandler for ErroringHandler {
     async fn handle(&self, _ctx: RpcContext, _request: Bytes) -> RpcResult<Bytes> {
         Err(RpcError::Handler(
-            "domain failure: invalid input".to_string().into(),
+            "domain failure: invalid input".to_owned().into(),
         ))
     }
 }

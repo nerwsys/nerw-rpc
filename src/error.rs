@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn unknown_method_displays_name() {
-        let err = RpcError::UnknownMethod("foo:bar@1.0.0/iface/m".to_string());
+        let err = RpcError::UnknownMethod("foo:bar@1.0.0/iface/m".to_owned());
         let s = err.to_string();
         assert!(s.contains("foo:bar@1.0.0/iface/m"));
     }
@@ -137,8 +137,8 @@ mod tests {
     #[test]
     fn version_mismatch_displays_both() {
         let err = RpcError::VersionMismatch {
-            requested: "2.0.0".to_string(),
-            available: vec!["1.0.0".to_string(), "1.1.0".to_string()],
+            requested: "2.0.0".to_owned(),
+            available: vec!["1.0.0".to_owned(), "1.1.0".to_owned()],
         };
         let s = err.to_string();
         assert!(s.contains("2.0.0"));
@@ -160,8 +160,8 @@ mod tests {
     #[test]
     fn transport_open_substream_displays_node_and_reason() {
         let err = RpcError::TransportOpenSubstream {
-            node_id: "abc-deadbeef".to_string(),
-            reason: "handshake timeout".to_string(),
+            node_id: "abc-deadbeef".to_owned(),
+            reason: "handshake timeout".to_owned(),
         };
         let s = err.to_string();
         assert!(s.contains("abc-deadbeef"));
@@ -171,8 +171,8 @@ mod tests {
     #[test]
     fn transport_register_alpn_displays_alpn() {
         let err = RpcError::TransportRegisterAlpn {
-            alpn: "tolki/wire-protocol/2.0.0".to_string(),
-            reason: "not preregistered".to_string(),
+            alpn: "tolki/wire-protocol/2.0.0".to_owned(),
+            reason: "not preregistered".to_owned(),
         };
         let s = err.to_string();
         assert!(s.contains("tolki/wire-protocol/2.0.0"));

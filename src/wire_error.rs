@@ -139,7 +139,14 @@ impl WireError {
             // Transport errors на server side never cross the wire in
             // practice — а write_all failure prevents writing the error
             // frame at all — but we keep the mapping total для exhaustiveness.
-            other => Self::HandlerError {
+            other @ (RpcError::Handler(_)
+            | RpcError::TransportOpenSubstream { .. }
+            | RpcError::TransportRegisterAlpn { .. }
+            | RpcError::TransportRead { .. }
+            | RpcError::TransportWrite { .. }
+            | RpcError::DatagramStreamIdCollision { .. }
+            | RpcError::DatagramStreamIdUnknown { .. }
+            | RpcError::DatagramTooShort { .. }) => Self::HandlerError {
                 display: other.to_string(),
             },
         }
@@ -172,7 +179,7 @@ impl WireError {
                 let inner = display
                     .strip_prefix("handler error: ")
                     .unwrap_or(&display)
-                    .to_string();
+                    .to_owned();
                 RpcError::Handler(inner.into())
             }
             Self::Codec { display } => {
@@ -193,7 +200,7 @@ mod tests {
     #[test]
     fn unknown_method_roundtrip_via_postcard() {
         let original = WireError::UnknownMethod {
-            method_name: "tolki:nope@1.0.0/iface/method".to_string(),
+            method_name: "tolki:nope@1.0.0/iface/method".to_owned(),
         };
         let bytes = postcard::to_allocvec(&original).expect("encode");
         // Discriminant byte must be 0x00 — locale-independent.
@@ -205,8 +212,8 @@ mod tests {
     #[test]
     fn version_mismatch_preserves_metadata() {
         let original = WireError::VersionMismatch {
-            requested: "2.0.0".to_string(),
-            available: vec!["1.0.0".to_string(), "1.1.0".to_string()],
+            requested: "2.0.0".to_owned(),
+            available: vec!["1.0.0".to_owned(), "1.1.0".to_owned()],
         };
         let bytes = postcard::to_allocvec(&original).expect("encode");
         assert_eq!(bytes[0], WIRE_ERROR_VERSION_MISMATCH);
@@ -217,7 +224,7 @@ mod tests {
                 available,
             } => {
                 assert_eq!(requested, "2.0.0");
-                assert_eq!(available, vec!["1.0.0".to_string(), "1.1.0".to_string()]);
+                assert_eq!(available, vec!["1.0.0".to_owned(), "1.1.0".to_owned()]);
             }
             other => panic!("expected VersionMismatch, got {other:?}"),
         }
@@ -226,7 +233,7 @@ mod tests {
     #[test]
     fn invalid_method_name_roundtrip() {
         let original = WireError::InvalidMethodName {
-            input: "not-a-valid-name".to_string(),
+            input: "not-a-valid-name".to_owned(),
         };
         let bytes = postcard::to_allocvec(&original).expect("encode");
         assert_eq!(bytes[0], WIRE_ERROR_INVALID_METHOD_NAME);
@@ -237,7 +244,7 @@ mod tests {
     #[test]
     fn malformed_frame_roundtrip() {
         let original = WireError::MalformedFrame {
-            reason: "truncated buffer".to_string(),
+            reason: "truncated buffer".to_owned(),
         };
         let bytes = postcard::to_allocvec(&original).expect("encode");
         assert_eq!(bytes[0], WIRE_ERROR_MALFORMED_FRAME);
@@ -248,7 +255,7 @@ mod tests {
     #[test]
     fn handler_error_roundtrip() {
         let original = WireError::HandlerError {
-            display: "domain error: invalid input".to_string(),
+            display: "domain error: invalid input".to_owned(),
         };
         let bytes = postcard::to_allocvec(&original).expect("encode");
         assert_eq!(bytes[0], WIRE_ERROR_HANDLER_ERROR);
@@ -258,7 +265,7 @@ mod tests {
 
     #[test]
     fn from_rpc_error_preserves_unknown_method() {
-        let rpc_err = RpcError::UnknownMethod("test:foo@1.0.0/i/m".to_string());
+        let rpc_err = RpcError::UnknownMethod("test:foo@1.0.0/i/m".to_owned());
         let wire = WireError::from_rpc_error(&rpc_err);
         match wire {
             WireError::UnknownMethod { method_name } => {
@@ -271,8 +278,8 @@ mod tests {
     #[test]
     fn from_rpc_error_preserves_version_mismatch() {
         let rpc_err = RpcError::VersionMismatch {
-            requested: "9.9.9".to_string(),
-            available: vec!["1.0.0".to_string()],
+            requested: "9.9.9".to_owned(),
+            available: vec!["1.0.0".to_owned()],
         };
         let wire = WireError::from_rpc_error(&rpc_err);
         match wire {
@@ -281,7 +288,7 @@ mod tests {
                 available,
             } => {
                 assert_eq!(requested, "9.9.9");
-                assert_eq!(available, vec!["1.0.0".to_string()]);
+                assert_eq!(available, vec!["1.0.0".to_owned()]);
             }
             other => panic!("expected VersionMismatch, got {other:?}"),
         }
@@ -290,7 +297,7 @@ mod tests {
     #[test]
     fn into_rpc_error_preserves_unknown_method() {
         let wire = WireError::UnknownMethod {
-            method_name: "x:y@1.0.0/i/m".to_string(),
+            method_name: "x:y@1.0.0/i/m".to_owned(),
         };
         let rpc = wire.into_rpc_error();
         match rpc {
@@ -302,8 +309,8 @@ mod tests {
     #[test]
     fn into_rpc_error_preserves_version_mismatch() {
         let wire = WireError::VersionMismatch {
-            requested: "9.9.9".to_string(),
-            available: vec!["1.0.0".to_string()],
+            requested: "9.9.9".to_owned(),
+            available: vec!["1.0.0".to_owned()],
         };
         let rpc = wire.into_rpc_error();
         match rpc {
@@ -312,7 +319,7 @@ mod tests {
                 available,
             } => {
                 assert_eq!(requested, "9.9.9");
-                assert_eq!(available, vec!["1.0.0".to_string()]);
+                assert_eq!(available, vec!["1.0.0".to_owned()]);
             }
             other => panic!("expected VersionMismatch, got {other:?}"),
         }
@@ -324,7 +331,7 @@ mod tests {
         // must remain total (we use it server-side as а defensive default
         // for any RpcError shape that does not have а dedicated wire variant).
         let rpc_err = RpcError::TransportRead {
-            reason: "io closed".to_string(),
+            reason: "io closed".to_owned(),
         };
         let wire = WireError::from_rpc_error(&rpc_err);
         match wire {
@@ -364,7 +371,7 @@ mod tests {
         // must preserve the payload verbatim — strip_prefix on absent prefix
         // returns the input unchanged.
         let wire_err = WireError::HandlerError {
-            display: "raw inner failure".to_string(),
+            display: "raw inner failure".to_owned(),
         };
         let client_err = wire_err.into_rpc_error();
         assert_eq!(client_err.to_string(), "handler error: raw inner failure");
@@ -380,7 +387,7 @@ mod tests {
         // name into UnknownMethod's payload — the discriminant byte is
         // what carries the variant information, not the human-readable
         // text.
-        let rpc_err = RpcError::UnknownMethod("неизвестный:метод@1.0.0/иф/м".to_string());
+        let rpc_err = RpcError::UnknownMethod("неизвестный:метод@1.0.0/иф/м".to_owned());
         let wire = WireError::from_rpc_error(&rpc_err);
         let bytes = postcard::to_allocvec(&wire).expect("encode");
         // Discriminant byte SHOULD be locale-invariant (always 0x00 для

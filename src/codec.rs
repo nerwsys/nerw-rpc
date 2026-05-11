@@ -64,7 +64,7 @@ mod tests {
     fn roundtrip_postcard() {
         let original = Sample {
             a: 42,
-            b: "hello".to_string(),
+            b: "hello".to_owned(),
             c: vec![1, 2, 3],
         };
         let bytes = encode(&original).expect("encode succeeds");
@@ -76,7 +76,7 @@ mod tests {
     fn encode_to_appends() {
         let v = Sample {
             a: 7,
-            b: "x".to_string(),
+            b: "x".to_owned(),
             c: vec![],
         };
         let mut buf = vec![0xFFu8, 0xFE]; // existing prefix

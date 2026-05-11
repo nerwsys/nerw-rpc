@@ -51,12 +51,48 @@ tempfile = "3.10"
 rcgen = "0.14"
 
 [lints.rust]
+# nerw-rpc уже `unsafe_code = "forbid"` — strictly stronger чем /src/tolki "warn", сохраняем
 unsafe_code = "forbid"
+unused = { level = "warn", priority = -1 }
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
-unwrap_used = "warn"
+nursery = { level = "warn", priority = -1 }
+# `multiple_crate_versions`: 13 occurrences come from upstream transitive
+# deps (iroh / nerw-core / rustls / tokio pull mismatched minor versions
+# of `cpufeatures`, `hashbrown`, `getrandom`, `windows-sys`, …). Cannot
+# be resolved in nerw-rpc's source; would require upstream coordination
+# of every dependency in the iroh tree. Demote к `allow` until the
+# ecosystem converges (currently warn-level в /src/tolki workspace).
+multiple_crate_versions = { level = "allow", priority = 1 }
+redundant_feature_names = "warn"
+unwrap_used = "deny"
 expect_used = "warn"
 panic = "warn"
 todo = "warn"
+unimplemented = "warn"
+dbg_macro = "deny"
+print_stdout = "warn"
+print_stderr = "warn"
+as_conversions = "warn"
+default_numeric_fallback = "warn"
+str_to_string = "warn"
+implicit_clone = "warn"
+string_add = "warn"
+undocumented_unsafe_blocks = "deny"
+missing_docs_in_private_items = "warn"
+clone_on_ref_ptr = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+arithmetic_side_effects = "warn"
+wildcard_enum_match_arm = "warn"
+module_name_repetitions = { level = "allow", priority = 1 }
+must_use_candidate = { level = "allow", priority = 1 }
+missing_errors_doc = { level = "allow", priority = 1 }
+missing_panics_doc = { level = "allow", priority = 1 }
+not_unsafe_ptr_arg_deref = { level = "allow", priority = 1 }
+cargo_common_metadata = { level = "allow", priority = 1 }
+negative_feature_names = { level = "allow", priority = 1 }

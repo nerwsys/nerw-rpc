@@ -216,8 +216,9 @@ impl DatagramDispatcher {
         // Compute the consumed varint length so we can split а Bytes
         // view (zero-copy) instead of an &[u8] reference. payload_slice
         // is а slice of frame; subtract its len from the original к
-        // get the prefix length.
-        let prefix_len = frame.len() - payload_slice.len();
+        // get the prefix length. `saturating_sub` guards against the
+        // (statically impossible) underflow в release builds.
+        let prefix_len = frame.len().saturating_sub(payload_slice.len());
         let payload = frame.slice(prefix_len..);
 
         // Lookup, clone Arc, drop the DashMap guard BEFORE awaiting

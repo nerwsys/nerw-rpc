@@ -73,8 +73,8 @@ impl MethodName {
     pub fn parse(s: &str) -> Option<Self> {
         let mut parts = s.splitn(3, '/');
         let pkg_part = parts.next()?;
-        let interface = parts.next()?.to_string();
-        let method = parts.next()?.to_string();
+        let interface = parts.next()?.to_owned();
+        let method = parts.next()?.to_owned();
 
         if pkg_part.is_empty() || interface.is_empty() || method.is_empty() {
             return None;
@@ -82,17 +82,20 @@ impl MethodName {
 
         let (package, version) = match pkg_part.find('@') {
             Some(idx) => {
-                let pkg = pkg_part[..idx].to_string();
-                let ver = pkg_part[idx + 1..].to_string();
+                let pkg = pkg_part[..idx].to_owned();
+                // `idx` is а valid index returned by `find`, so
+                // `idx < pkg_part.len() <= usize::MAX`. `saturating_add`
+                // is а formality к satisfy `arithmetic_side_effects`.
+                let ver = pkg_part[idx.saturating_add(1)..].to_owned();
                 if pkg.is_empty() || ver.is_empty() {
                     return None;
                 }
                 (pkg, Some(ver))
             }
-            None => (pkg_part.to_string(), None),
+            None => (pkg_part.to_owned(), None),
         };
 
-        Some(MethodName {
+        Some(Self {
             package,
             version,
             interface,
@@ -103,10 +106,10 @@ impl MethodName {
     /// Reconstruct the canonical text representation.
     #[must_use]
     pub fn to_canonical(&self) -> String {
-        match &self.version {
-            Some(v) => format!("{}@{}/{}/{}", self.package, v, self.interface, self.method),
-            None => format!("{}/{}/{}", self.package, self.interface, self.method),
-        }
+        self.version.as_ref().map_or_else(
+            || format!("{}/{}/{}", self.package, self.interface, self.method),
+            |v| format!("{}@{}/{}/{}", self.package, v, self.interface, self.method),
+        )
     }
 }
 
@@ -122,6 +125,10 @@ impl MethodName {
 /// upgrade the resolver to use a real semver parser.
 #[derive(Default)]
 pub struct MethodRegistry {
+    /// Canonical-name keyed handler map. Key is the fully-qualified
+    /// `package@version/interface/method` string. Versioned and
+    /// version-omitted lookups both index into this single map (see
+    /// [`MethodRegistry::lookup`] для resolution rules).
     handlers: HashMap<String, Arc<dyn MethodHandler>>,
 }
 
@@ -148,7 +155,7 @@ impl MethodRegistry {
             parsed.version.is_some(),
             "registered handlers must include version: got {canonical_name}"
         );
-        self.handlers.insert(canonical_name.to_string(), handler);
+        self.handlers.insert(canonical_name.to_owned(), handler);
     }
 
     /// Lookup a handler by canonical name.
@@ -201,7 +208,7 @@ mod tests {
     fn parse_pinned_method_name() {
         let n = MethodName::parse("tolki:chat@1.0.0/chat/send-message").expect("parse");
         assert_eq!(n.package, "tolki:chat");
-        assert_eq!(n.version, Some("1.0.0".to_string()));
+        assert_eq!(n.version, Some("1.0.0".to_owned()));
         assert_eq!(n.interface, "chat");
         assert_eq!(n.method, "send-message");
     }

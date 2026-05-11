@@ -22,7 +22,32 @@
 //! `/src/tasks/tolki-server/.artifacts/research/NERW-RPC-DESIGN.md`.
 
 #![doc(html_root_url = "https://docs.rs/nerw-rpc/0.3.0")]
-#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
+#![cfg_attr(
+    test,
+    allow(
+        // Assertions in tests are explicit by design.
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::panic,
+        // `_ => panic!("expected variant X, got {other:?}")` is the
+        // idiomatic test pattern for narrow variant assertions. Listing
+        // every variant explicitly бы добавил noise без security gain
+        // (test code, not production crossing trust boundary).
+        clippy::wildcard_enum_match_arm,
+        // Numeric literals in test asserts default к i32 which is fine
+        // — tests never round-trip to disk/wire, no portability risk.
+        clippy::default_numeric_fallback,
+        // `Arc::clone(&h)` vs `h.clone()` — test code is exempt; the
+        // semantic distinction matters only at production-call sites.
+        clippy::clone_on_ref_ptr,
+        // `h as Arc<dyn Trait>` upcast в `Arc::ptr_eq` test —
+        // unsizing coercion is the language-blessed way.
+        clippy::as_conversions,
+        // `Vec::with_capacity(1 + body.len())` test buffer builders.
+        // Overflow path is statically impossible for fixture-sized inputs.
+        clippy::arithmetic_side_effects,
+    )
+)]
 
 pub mod client;
 pub mod codec;

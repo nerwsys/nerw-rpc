@@ -59,7 +59,12 @@ pub const OPCODE_STREAM_END: u8 = 0x12;
 /// buffer in the future).
 pub fn encode_method_name(name: &str, buf: &mut Vec<u8>) -> RpcResult<()> {
     let bytes = name.as_bytes();
-    leb128::write::unsigned(buf, bytes.len() as u64)
+    // `usize → u64` via `try_from`: lossless on every platform Rust runs
+    // on today (usize::BITS ≤ 64), but kept honest for hypothetical
+    // 128-bit targets where the `as` cast would silently truncate.
+    let len = u64::try_from(bytes.len())
+        .map_err(|e| RpcError::MalformedFrame(format!("method-name length overflow: {e}")))?;
+    leb128::write::unsigned(buf, len)
         .map_err(|e| RpcError::MalformedFrame(format!("leb128 write: {e}")))?;
     buf.extend_from_slice(bytes);
     Ok(())
@@ -87,17 +92,20 @@ pub fn decode_method_name(input: &[u8]) -> RpcResult<(&str, &[u8])> {
     }
     let consumed = usize::try_from(cursor.position())
         .map_err(|e| RpcError::MalformedFrame(format!("cursor overflow: {e}")))?;
-    if consumed
-        .checked_add(name_len)
-        .is_none_or(|end| end > input.len())
-    {
-        return Err(RpcError::MalformedFrame(
-            "method-name length exceeds buffer".to_string(),
-        ));
-    }
-    let name = std::str::from_utf8(&input[consumed..consumed + name_len])
+    // Bind the checked sum so subsequent indexing uses the same value
+    // — avoids а second `consumed + name_len` that clippy cannot prove
+    // safe (we just proved it manually above).
+    let name_end = match consumed.checked_add(name_len) {
+        Some(end) if end <= input.len() => end,
+        _ => {
+            return Err(RpcError::MalformedFrame(
+                "method-name length exceeds buffer".to_owned(),
+            ));
+        }
+    };
+    let name = std::str::from_utf8(&input[consumed..name_end])
         .map_err(|e| RpcError::MalformedFrame(format!("non-UTF-8 method-name: {e}")))?;
-    Ok((name, &input[consumed + name_len..]))
+    Ok((name, &input[name_end..]))
 }
 
 /// Encode а datagram stream-id prefix as а LEB128 varint.

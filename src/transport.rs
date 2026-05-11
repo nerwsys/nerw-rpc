@@ -128,6 +128,8 @@ pub const NERW_RPC_ALPNS: &[&[u8]] = &[
 /// [`nerw_core::client::Client::shutdown`] at process exit.
 #[derive(Debug, Clone)]
 pub struct IrohTransportClient {
+    /// Shared owner of the iroh endpoint + accept loop. `Arc` makes
+    /// [`IrohTransportClient`] cheap к clone across spawned tasks.
     inner: Arc<nerw_core::client::Client>,
 }
 
@@ -146,7 +148,7 @@ impl IrohTransportClient {
     /// its public surface — e.g. `peer_table().insert(...)` during
     /// test setup).
     #[must_use]
-    pub fn inner(&self) -> &Arc<nerw_core::client::Client> {
+    pub const fn inner(&self) -> &Arc<nerw_core::client::Client> {
         &self.inner
     }
 

@@ -362,7 +362,7 @@ mod tests {
             master_pubkey: [0u8; 32],
             user_id: Uuid::new_v4(),
             device_id: Uuid::new_v4(),
-            scopes: vec!["chat:send".to_string(), "profile:read".to_string()],
+            scopes: vec!["chat:send".to_owned(), "profile:read".to_owned()],
             registered_at_ms: 0,
             last_seen_at_ms: 0,
         };
