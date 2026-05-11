@@ -139,7 +139,14 @@ impl WireError {
             // Transport errors на server side never cross the wire in
             // practice — а write_all failure prevents writing the error
             // frame at all — but we keep the mapping total для exhaustiveness.
-            other => Self::HandlerError {
+            other @ (RpcError::Handler(_)
+            | RpcError::TransportOpenSubstream { .. }
+            | RpcError::TransportRegisterAlpn { .. }
+            | RpcError::TransportRead { .. }
+            | RpcError::TransportWrite { .. }
+            | RpcError::DatagramStreamIdCollision { .. }
+            | RpcError::DatagramStreamIdUnknown { .. }
+            | RpcError::DatagramTooShort { .. }) => Self::HandlerError {
                 display: other.to_string(),
             },
         }
