@@ -61,7 +61,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
-multiple_crate_versions = "warn"
+# `multiple_crate_versions`: 13 occurrences come from upstream transitive
+# deps (iroh / nerw-core / rustls / tokio pull mismatched minor versions
+# of `cpufeatures`, `hashbrown`, `getrandom`, `windows-sys`, …). Cannot
+# be resolved in nerw-rpc's source; would require upstream coordination
+# of every dependency in the iroh tree. Demote к `allow` until the
+# ecosystem converges (currently warn-level в /src/tolki workspace).
+multiple_crate_versions = { level = "allow", priority = 1 }
 redundant_feature_names = "warn"
 unwrap_used = "deny"
 expect_used = "warn"
