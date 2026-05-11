@@ -11,11 +11,10 @@
     clippy::default_numeric_fallback,
 )]
 
-//! End-to-end nerw-rpc Phase 2 integration tests.
+//! End-to-end nerw-rpc Phase 2.1 integration tests.
 //!
 //! Stand up two `nerw_core::client::Client` instances on loopback, wire
 //! them statically via the peer table, and exercise:
-//!
 //!
 //! 1. **Unary RPC roundtrip** — client opens а bidi substream к server,
 //!    writes а framed unary request с method-name `test:hello@1.0.0/test/echo`,
@@ -28,16 +27,30 @@
 //!    not registered; the framework returns
 //!    [`nerw_rpc::RpcError::UnknownMethod`] cleanly.
 //! 4. **Datagram dispatch** — server registers а
-//!    [`nerw_rpc::DatagramHandler`] under а handshake stream-id; client
-//!    sends а datagram с а matching `varint(stream-id)` prefix;
-//!    server's broadcast loop dispatches к the handler и observes
-//!    the payload.
+//!    [`nerw_rpc::DatagramHandler`] под а handshake stream-id и а
+//!    custom `AlpnHandler` для the datagram ALPN; client dials с the
+//!    datagram ALPN and sends а datagram with а matching
+//!    `varint(stream-id)` prefix; server's per-connection read loop
+//!    dispatches к the handler и observes the payload.
+//! 5. **ALPN dispatch** — multiple ALPNs route к distinct handlers
+//!    (Phase 2.1 N1 — verifies the server's internal dispatch table).
+//! 6. **N2 eviction** — transport read/write errors trigger
+//!    `evict_cached_connection` (Phase 2.1 N2).
 //!
 //! TLS strategy mirrors `nerw_core/tests/stream_control_smoke.rs`:
 //! rcgen generates а fresh self-signed CA per test run и pins it via
 //! `ClientConfigBuilder::with_ca_pem_path`. No relay or DNS server is
 //! contacted; endpoints discover each other via loopback IP transport
 //! addrs published into each peer table.
+//!
+//! ## Post-R3 fixture changes
+//!
+//! Identity now comes from `SecretKey::generate()` instead of а file
+//! path (R3 removed `with_identity_path`). Datagram tests dial а
+//! connection directly с the datagram ALPN — pre-R3 nerw-core's
+//! built-in `send_datagram`/`subscribe_datagrams` channel is gone, и
+//! [`DatagramDispatcher::subscribe_connection`] now owns the
+//! per-connection read loop.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,13 +59,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use iroh::{EndpointAddr, TransportAddr};
+use iroh::endpoint::Connection;
+use iroh::{EndpointAddr, SecretKey, TransportAddr};
 use nerw_core::client::{Client, ClientConfig};
-use nerw_core::protocol::ALPN_NERW_RPC;
 use nerw_rpc::{
-    ALPN_TOLKI_DATAGRAM_2_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, DatagramDispatcher, DatagramHandler,
-    IrohTransportClient, MethodHandler, MethodRegistry, RpcClient, RpcContext, RpcError, RpcResult,
-    RpcServer, RpcServerConfig, wire::encode_stream_id,
+    ALPN_NERW_RPC_2_0_0, ALPN_TOLKI_DATAGRAM_2_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, AlpnHandler,
+    DatagramDispatcher, DatagramHandler, IrohTransportClient, MethodHandler, MethodRegistry,
+    RpcClient, RpcContext, RpcError, RpcResult, RpcServer, RpcServerConfig, wire::encode_stream_id,
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -73,23 +86,26 @@ fn write_self_signed_ca(dest: &std::path::Path) -> Result<()> {
 }
 
 /// Build а multi-ALPN test [`ClientConfig`] suitable для loopback
-/// nerw-rpc Phase 2 tests. Pre-registers ALL three ALPNs the framework
+/// nerw-rpc Phase 2.1 tests. Pre-registers ALL three ALPNs the framework
 /// dispatches plus the built-in `nerw/rpc/2.0.0` so the endpoint
 /// accepts every protocol nerw-rpc + nerw-core might negotiate.
+///
+/// Identity is generated in-process via [`SecretKey::generate`] —
+/// post-R3 nerw-core does not own filesystem persistence для identity
+/// keys.
 fn make_test_config(tmp: &TempDir, label: &str) -> Result<(ClientConfig, PathBuf)> {
-    let identity_path = tmp.path().join(format!("{label}.key"));
     let ca_pem = tmp.path().join(format!("{label}-ca.pem"));
     write_self_signed_ca(&ca_pem)?;
     let cfg = ClientConfig::builder()
-        .with_identity_path(&identity_path)
+        .with_secret_key(SecretKey::generate())
         .with_ca_pem_path(&ca_pem)
         .with_relay_url("https://127.0.0.1:1/")
-        .with_alpn(ALPN_NERW_RPC.to_vec())
+        .with_alpn(ALPN_NERW_RPC_2_0_0.to_vec())
         .with_alpn(ALPN_TOLKI_WIRE_PROTOCOL_2_0_0.to_vec())
         .with_alpn(ALPN_TOLKI_DATAGRAM_2_0_0.to_vec())
         .with_discovery(None)
         .build();
-    Ok((cfg, identity_path))
+    Ok((cfg, ca_pem))
 }
 
 /// Pick the first IP transport addr from `ep.addr().addrs`.
@@ -118,7 +134,7 @@ impl MethodHandler for EchoMethodHandler {
 }
 
 /// Versioned-tag handler — responds с а tag identifying the version
-/// it was registered under, so the version-resolution test can verify
+/// it was registered under, так version-resolution test can verify
 /// которую version actually got picked.
 struct TagHandler {
     tag: &'static str,
@@ -132,9 +148,7 @@ impl MethodHandler for TagHandler {
 }
 
 /// Build а pair of (alpha-client, bravo-server) wired-together
-/// instances. Returns the underlying transport handles plus the bravo
-/// `Client` (so the caller can populate alpha's peer table с bravo's
-/// address).
+/// instances. Returns the underlying transport handles.
 struct DuoFixture {
     alpha_transport: IrohTransportClient,
     bravo_transport: IrohTransportClient,
@@ -143,8 +157,8 @@ struct DuoFixture {
 async fn build_duo(label_a: &str, label_b: &str) -> Result<(DuoFixture, TempDir, TempDir)> {
     let tmp_a = tempfile::tempdir().context("tempdir A")?;
     let tmp_b = tempfile::tempdir().context("tempdir B")?;
-    let (cfg_a, _id_a) = make_test_config(&tmp_a, label_a)?;
-    let (cfg_b, _id_b) = make_test_config(&tmp_b, label_b)?;
+    let (cfg_a, _ca_a) = make_test_config(&tmp_a, label_a)?;
+    let (cfg_b, _ca_b) = make_test_config(&tmp_b, label_b)?;
     let alpha = Client::start(cfg_a).await.context("start alpha")?;
     let bravo = Client::start(cfg_b).await.context("start bravo")?;
 
@@ -178,7 +192,7 @@ async fn unary_rpc_roundtrip() -> Result<()> {
     let mut registry = MethodRegistry::new();
     registry.register("test:hello@1.0.0/test/echo", Arc::new(EchoMethodHandler));
     let registry = Arc::new(registry);
-    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     // Client side.
@@ -219,7 +233,7 @@ async fn version_omitted_resolves_to_latest() -> Result<()> {
         Arc::new(TagHandler { tag: "v2" }),
     );
     let registry = Arc::new(registry);
-    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -265,7 +279,7 @@ async fn unknown_method_returns_typed_error() -> Result<()> {
     let mut registry = MethodRegistry::new();
     registry.register("test:hello@1.0.0/test/echo", Arc::new(EchoMethodHandler));
     let registry = Arc::new(registry);
-    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -307,10 +321,26 @@ impl DatagramHandler for RecordingDatagramHandler {
     }
 }
 
+/// Custom [`AlpnHandler`] for the datagram ALPN — wires inbound
+/// connections to а [`DatagramDispatcher`] via
+/// [`DatagramDispatcher::subscribe_connection`]. Phase 2.1's stand-in
+/// for the gone `subscribe_datagrams` broadcast channel.
+struct DatagramAlpnHandler {
+    dispatcher: Arc<DatagramDispatcher>,
+}
+
+#[async_trait]
+impl AlpnHandler for DatagramAlpnHandler {
+    async fn handle(&self, connection: Connection) -> RpcResult<()> {
+        Arc::clone(&self.dispatcher).subscribe_connection(connection);
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn datagram_dispatch_roundtrip() -> Result<()> {
     // Bravo: dispatcher с handler keyed by handshake stream-id 42.
-    // In production code, the stream-id is the QUIC stream-id of the
+    // В production code, the stream-id is the QUIC stream-id of the
     // bidi handshake stream that established the voice session; here
     // we mock it as а constant since the test does not perform an
     // actual handshake (the dispatch surface itself is what we exercise).
@@ -329,47 +359,41 @@ async fn datagram_dispatch_roundtrip() -> Result<()> {
         .register(HANDSHAKE_STREAM_ID, handler)
         .expect("register");
 
-    // Spawn а subscriber loop that reads from bravo's datagram broadcast
-    // и dispatches к the table. Must subscribe BEFORE alpha sends so
-    // the broadcast channel does not drop the frame.
-    let bravo_inner = Arc::clone(fix.bravo_transport.inner());
-    let dispatcher_loop = Arc::clone(&dispatcher);
-    let mut rx = bravo_inner.subscribe_datagrams();
-    let task = tokio::spawn(async move {
-        // Read а handful of frames; tests stop the loop after the
-        // first observed payload via the notify channel.
-        while let Ok(frame) = rx.recv().await {
-            let ctx = DatagramDispatcher::build_context(frame.from_peer);
-            // Errors are логированы by the dispatcher; tests assert
-            // via the recorded buffer.  frame.payload is already Bytes;
-            // .clone() bumps the ref-count, no allocation.
-            let _ = dispatcher_loop.dispatch(ctx, frame.payload.clone()).await;
-        }
+    // Bravo serves the RPC ALPN (default) and additionally registers а
+    // custom AlpnHandler для the datagram ALPN that wires inbound
+    // connections к the dispatcher's per-connection read loop.
+    let registry = Arc::new(MethodRegistry::new());
+    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let datagram_alpn_handler: Arc<dyn AlpnHandler> = Arc::new(DatagramAlpnHandler {
+        dispatcher: Arc::clone(&dispatcher),
     });
+    server.register_alpn_handler(ALPN_TOLKI_DATAGRAM_2_0_0, datagram_alpn_handler);
+    server.serve().await.context("server.serve")?;
 
-    // Alpha: send а datagram с varint(stream-id) prefix:
-    // [varint(42) | "RTP-FRAME"]. We use the nerw-core send_datagram
-    // surface; the "agent_name" is the routing prefix at the
-    // nerw-mesh layer (8B BLAKE3) — distinct from our application-level
-    // varint(stream-id) prefix. We pick "bravo" as the mesh-layer
-    // routing tag; both peers share а connection so the datagram lands.
+    // Alpha dials с the datagram ALPN — this triggers bravo's accept
+    // loop к invoke the DatagramAlpnHandler, which spawns the per-conn
+    // read loop on the dispatcher.
     let alpha_inner = Arc::clone(fix.alpha_transport.inner());
     let bravo_id = fix.bravo_transport.node_id();
+    let conn = alpha_inner
+        .dial_with_alpn(&bravo_id, ALPN_TOLKI_DATAGRAM_2_0_0)
+        .await
+        .context("dial_with_alpn")?;
+
+    // Give bravo's accept loop а moment к pick up the connection и
+    // wire the dispatcher's read loop. Without this, alpha may send
+    // before bravo subscribes и the datagram will be dropped by the
+    // peer-side stack before our loop sees it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send а datagram с varint(stream-id) prefix:
+    // [varint(42) | "RTP-FRAME"]
     let mut payload = Vec::new();
     encode_stream_id(HANDSHAKE_STREAM_ID, &mut payload).expect("encode stream-id");
     payload.extend_from_slice(b"RTP-FRAME");
 
-    // Datagrams require а pre-existing nerw-rpc connection to be cached
-    // because nerw-core piggybacks on the ALPN_NERW_RPC connection.
-    // nerw-core's send_datagram establishes the connection if missing
-    // — see Client::get_or_connect_for_datagrams.
-    timeout(
-        Duration::from_secs(15),
-        alpha_inner.send_datagram(&bravo_id, "bravo", &payload),
-    )
-    .await
-    .context("send_datagram timed out")?
-    .context("send_datagram errored")?;
+    conn.send_datagram(Bytes::from(payload))
+        .context("send_datagram")?;
 
     // Wait for the handler к observe the frame.
     timeout(Duration::from_secs(10), notify.notified())
@@ -384,7 +408,6 @@ async fn datagram_dispatch_roundtrip() -> Result<()> {
     );
     drop(recorded);
 
-    task.abort();
     Ok(())
 }
 
@@ -394,14 +417,14 @@ async fn datagram_dispatch_roundtrip() -> Result<()> {
 /// Pure unit-level concerns (collision detection, idempotent
 /// unregister, varint encode/decode) are also exercised inline в
 /// `src/datagram.rs::tests` и `src/wire.rs::tests`; the integration
-/// tests here verify the SAME behaviour at the broadcast-loop level
+/// tests here verify the SAME behaviour at the read-loop level
 /// where real datagrams arrive.
 #[tokio::test]
 async fn datagram_handshake_correlation_roundtrip() -> Result<()> {
     // Verify the WebTransport-style correlation contract end-to-end:
     // dispatcher registers а handler under а handshake stream-id и
     // routes datagrams carrying а matching varint(stream-id) prefix
-    // к that handler. We use а large stream-id (1_000_000) to exercise
+    // к that handler. We use а large stream-id (1_000_000) к exercise
     // the multi-byte varint path that the legacy 1-byte token could
     // not represent.
     const HANDSHAKE_STREAM_ID: u64 = 1_000_000;
@@ -418,30 +441,30 @@ async fn datagram_handshake_correlation_roundtrip() -> Result<()> {
         .register(HANDSHAKE_STREAM_ID, handler)
         .expect("register");
 
-    let bravo_inner = Arc::clone(fix.bravo_transport.inner());
-    let dispatcher_loop = Arc::clone(&dispatcher);
-    let mut rx = bravo_inner.subscribe_datagrams();
-    let task = tokio::spawn(async move {
-        while let Ok(frame) = rx.recv().await {
-            let ctx = DatagramDispatcher::build_context(frame.from_peer);
-            let _ = dispatcher_loop.dispatch(ctx, frame.payload.clone()).await;
-        }
+    let registry = Arc::new(MethodRegistry::new());
+    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let datagram_alpn_handler: Arc<dyn AlpnHandler> = Arc::new(DatagramAlpnHandler {
+        dispatcher: Arc::clone(&dispatcher),
     });
+    server.register_alpn_handler(ALPN_TOLKI_DATAGRAM_2_0_0, datagram_alpn_handler);
+    server.serve().await.context("server.serve")?;
 
-    // [varint(1_000_000) | "VOICE-FRAME"]
     let alpha_inner = Arc::clone(fix.alpha_transport.inner());
     let bravo_id = fix.bravo_transport.node_id();
+    let conn = alpha_inner
+        .dial_with_alpn(&bravo_id, ALPN_TOLKI_DATAGRAM_2_0_0)
+        .await
+        .context("dial_with_alpn")?;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // [varint(1_000_000) | "VOICE-FRAME"]
     let mut payload = Vec::new();
     encode_stream_id(HANDSHAKE_STREAM_ID, &mut payload).expect("encode stream-id");
     payload.extend_from_slice(b"VOICE-FRAME");
 
-    timeout(
-        Duration::from_secs(15),
-        alpha_inner.send_datagram(&bravo_id, "bravo", &payload),
-    )
-    .await
-    .context("send_datagram timed out")?
-    .context("send_datagram errored")?;
+    conn.send_datagram(Bytes::from(payload))
+        .context("send_datagram")?;
 
     timeout(Duration::from_secs(10), notify.notified())
         .await
@@ -455,7 +478,6 @@ async fn datagram_handshake_correlation_roundtrip() -> Result<()> {
     );
     drop(recorded);
 
-    task.abort();
     Ok(())
 }
 
@@ -519,7 +541,6 @@ async fn datagram_stream_id_unregister_idempotent() {
 //  - malformed inbound bytes (server stays alive, returns MalformedFrame)
 //  - handler-returned errors (client decodes RpcError::Handler)
 //  - large payloads (1 MiB roundtrip stays within 8 MiB read limit)
-//  - datagram unknown stream-ids (DatagramStreamIdUnknown surfaced)
 //  - bounded concurrent streams (Semaphore enforces max_concurrent_streams)
 // =============================================================================
 
@@ -553,7 +574,7 @@ async fn concurrent_calls_do_not_serialize() -> Result<()> {
         }),
     );
     let registry = Arc::new(registry);
-    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -607,7 +628,7 @@ async fn mid_rpc_connection_drop_surfaces_transport_error() -> Result<()> {
         }),
     );
     let registry = Arc::new(registry);
-    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -660,12 +681,12 @@ async fn malformed_inbound_does_not_crash_server() -> Result<()> {
     let mut registry = MethodRegistry::new();
     registry.register("test:hello@1.0.0/test/echo", Arc::new(EchoMethodHandler));
     let registry = Arc::new(registry);
-    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let bravo_id = fix.bravo_transport.node_id();
 
-    // Open the bidi substream directly without RpcClient framing so we
+    // Open the bidi substream directly без RpcClient framing так we
     // can ship garbage opcodes.  We bypass RpcClient::call entirely
     // because it auto-frames с OPCODE_UNARY_REQUEST.
     let alpha_inner = Arc::clone(fix.alpha_transport.inner());
@@ -740,7 +761,7 @@ async fn handler_returns_error_propagates() -> Result<()> {
     let mut registry = MethodRegistry::new();
     registry.register("test:hello@1.0.0/test/fail", Arc::new(ErroringHandler));
     let registry = Arc::new(registry);
-    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -779,7 +800,7 @@ async fn large_payload_1mb_roundtrip() -> Result<()> {
     let mut registry = MethodRegistry::new();
     registry.register("test:hello@1.0.0/test/echo", Arc::new(EchoMethodHandler));
     let registry = Arc::new(registry);
-    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -799,72 +820,9 @@ async fn large_payload_1mb_roundtrip() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn datagram_unknown_stream_id_observable() -> Result<()> {
-    // The datagram dispatcher's behaviour on an unregistered stream-id
-    // is а unit-tested concern (see datagram::tests::
-    // dispatch_unknown_stream_id_errors), but we want к verify it
-    // integrates cleanly с the broadcast-loop path used by real
-    // datagram traffic.
-    // Stream-id 99 is intentionally NOT registered.
-    const GHOST_STREAM_ID: u64 = 99;
-
-    let (fix, _tmp_a, _tmp_b) = build_duo("unk-sid-alpha", "unk-sid-bravo").await?;
-
-    let dispatcher = Arc::new(DatagramDispatcher::new());
-
-    let bravo_inner = Arc::clone(fix.bravo_transport.inner());
-    let dispatcher_loop = Arc::clone(&dispatcher);
-    let mut rx = bravo_inner.subscribe_datagrams();
-    let observed = Arc::new(Mutex::new(Vec::<RpcError>::new()));
-    let observed_clone = Arc::clone(&observed);
-    let task = tokio::spawn(async move {
-        if let Ok(frame) = rx.recv().await {
-            let ctx = DatagramDispatcher::build_context(frame.from_peer);
-            // Dispatch must return DatagramStreamIdUnknown — observable
-            // via the returned error, not silently swallowed.
-            let r = dispatcher_loop.dispatch(ctx, frame.payload.clone()).await;
-            if let Err(e) = r {
-                observed_clone.lock().await.push(e);
-            }
-        }
-    });
-
-    // Send а datagram с varint(stream-id=99) prefix (unregistered).
-    let alpha_inner = Arc::clone(fix.alpha_transport.inner());
-    let bravo_id = fix.bravo_transport.node_id();
-    let mut payload = Vec::new();
-    encode_stream_id(GHOST_STREAM_ID, &mut payload).expect("encode stream-id");
-    payload.extend_from_slice(b"GHOST-FRAME");
-    timeout(
-        Duration::from_secs(15),
-        alpha_inner.send_datagram(&bravo_id, "bravo", &payload),
-    )
-    .await
-    .context("send_datagram timed out")?
-    .context("send_datagram errored")?;
-
-    // Wait briefly for the dispatcher loop к observe the frame.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let errors = observed.lock().await;
-    assert_eq!(
-        errors.len(),
-        1,
-        "exactly one DatagramStreamIdUnknown error must be observable",
-    );
-    match &errors[0] {
-        RpcError::DatagramStreamIdUnknown { stream_id } => assert_eq!(*stream_id, GHOST_STREAM_ID),
-        other => panic!("expected DatagramStreamIdUnknown, got {other:?}"),
-    }
-    drop(errors);
-    task.abort();
-    Ok(())
-}
-
 /// Barrier handler — increments а counter on entry, blocks until
 /// notified, decrements on exit. Lets us assert how many concurrent
-/// invocations are in flight at any moment.
+/// invocations are в flight at any moment.
 struct BarrierHandler {
     in_flight: Arc<std::sync::atomic::AtomicU32>,
     max_observed: Arc<std::sync::atomic::AtomicU32>,
@@ -913,7 +871,8 @@ async fn max_concurrent_streams_enforced() -> Result<()> {
         max_concurrent_streams: 2,
         max_concurrent_connections: 1024,
     };
-    let server = RpcServer::with_config(fix.bravo_transport.clone(), Arc::clone(&registry), cfg);
+    let mut server =
+        RpcServer::with_config(fix.bravo_transport.clone(), Arc::clone(&registry), cfg);
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -974,5 +933,187 @@ async fn max_concurrent_streams_enforced() -> Result<()> {
         peak <= 2,
         "max concurrent in-flight handlers was {peak}, expected ≤ 2 (Semaphore cap)",
     );
+    Ok(())
+}
+
+// =============================================================================
+// Phase 2.1 new tests — verify ALPN dispatch table and N2 stale-conn eviction.
+// =============================================================================
+
+/// Counter handler — increments on each connection. Used к verify
+/// custom [`AlpnHandler`]s receive their inbound connections.
+struct ConnectionCountingAlpnHandler {
+    invocations: Arc<std::sync::atomic::AtomicU32>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl AlpnHandler for ConnectionCountingAlpnHandler {
+    async fn handle(&self, _connection: Connection) -> RpcResult<()> {
+        self.invocations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_one();
+        // Do not return until the test releases us — keeps the
+        // connection open so the inbound side observes it.
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn accept_loop_dispatches_by_alpn() -> Result<()> {
+    // Two ALPNs, two handlers — the dispatcher must route inbound
+    // connections к the correct handler based on negotiated ALPN.
+    // The wire-protocol ALPN goes к its built-in handler (а full RPC
+    // roundtrip exercises it); the datagram ALPN goes к а custom
+    // counting handler we register.
+
+    let (fix, _tmp_a, _tmp_b) = build_duo("alpn-disp-alpha", "alpn-disp-bravo").await?;
+
+    let mut registry = MethodRegistry::new();
+    registry.register("test:hello@1.0.0/test/echo", Arc::new(EchoMethodHandler));
+    let registry = Arc::new(registry);
+    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+
+    let datagram_invocations = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let datagram_notify = Arc::new(tokio::sync::Notify::new());
+    let datagram_handler: Arc<dyn AlpnHandler> = Arc::new(ConnectionCountingAlpnHandler {
+        invocations: Arc::clone(&datagram_invocations),
+        notify: Arc::clone(&datagram_notify),
+    });
+    server.register_alpn_handler(ALPN_TOLKI_DATAGRAM_2_0_0, datagram_handler);
+    server.serve().await.context("server.serve")?;
+
+    // After serve(), the built-in wire handler + our custom datagram
+    // handler should both be registered (2 entries).
+    assert_eq!(
+        server.registered_alpn_count(),
+        2,
+        "serve must install built-in wire handler alongside our custom one",
+    );
+
+    let bravo_id = fix.bravo_transport.node_id();
+
+    // 1. Wire-protocol ALPN — full RPC roundtrip routes к the built-in handler.
+    let client = RpcClient::new(fix.alpha_transport.clone());
+    let response = timeout(
+        Duration::from_secs(15),
+        client.call(
+            &bravo_id,
+            "test:hello@1.0.0/test/echo",
+            Bytes::from_static(b"WIRE-ALPN"),
+        ),
+    )
+    .await
+    .context("wire call timed out")?
+    .context("wire call errored")?;
+    assert_eq!(&response[..], b"WIRE-ALPN");
+
+    // 2. Datagram ALPN — dialing с this ALPN MUST invoke our custom
+    // handler, NOT the wire handler. Verify by counter.
+    let alpha_inner = Arc::clone(fix.alpha_transport.inner());
+    let _conn = alpha_inner
+        .dial_with_alpn(&bravo_id, ALPN_TOLKI_DATAGRAM_2_0_0)
+        .await
+        .context("dial datagram ALPN")?;
+
+    timeout(Duration::from_secs(10), datagram_notify.notified())
+        .await
+        .context("datagram-ALPN handler never invoked")?;
+
+    let count = datagram_invocations.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        count, 1,
+        "datagram ALPN handler must have been invoked exactly once",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn evict_cached_connection_on_transport_error() -> Result<()> {
+    // N2 stale-conn defence: when а transport read/write error
+    // surfaces, the client evicts the cached connection so the next
+    // call dials а fresh handshake instead of replaying а dead entry.
+    //
+    // We verify this via the test-utils-gated `conn_cache_len()` —
+    // after а successful call, the cache holds one entry;
+    // after а mid-RPC server teardown that triggers TransportRead, the
+    // cache must drop back к zero.
+
+    let (fix, _tmp_a, _tmp_b) = build_duo("evict-alpha", "evict-bravo").await?;
+
+    let mut registry = MethodRegistry::new();
+    registry.register("test:hello@1.0.0/test/echo", Arc::new(EchoMethodHandler));
+    registry.register(
+        "test:hello@1.0.0/test/slow",
+        Arc::new(SlowHandler {
+            delay: Duration::from_secs(5),
+            invocations: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }),
+    );
+    let registry = Arc::new(registry);
+    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    server.serve().await.context("server.serve")?;
+
+    let client = RpcClient::new(fix.alpha_transport.clone());
+    let bravo_id = fix.bravo_transport.node_id();
+    let alpha_inner = Arc::clone(fix.alpha_transport.inner());
+
+    // 1. Baseline — successful call populates the connection cache.
+    timeout(
+        Duration::from_secs(15),
+        client.call(
+            &bravo_id,
+            "test:hello@1.0.0/test/echo",
+            Bytes::from_static(b"WARM-CACHE"),
+        ),
+    )
+    .await
+    .context("baseline call timed out")?
+    .context("baseline call errored")?;
+
+    let cache_len_after_warmup = alpha_inner.conn_cache_len().await;
+    assert_eq!(
+        cache_len_after_warmup, 1,
+        "successful call should populate the (peer, alpn) cache",
+    );
+
+    // 2. Trigger а transport error. Spawn а slow call в background,
+    // then close bravo's endpoint mid-flight to provoke TransportRead.
+    let call_handle = {
+        let client = client.clone();
+        let bravo_id_owned = bravo_id;
+        tokio::spawn(async move {
+            client
+                .call(
+                    &bravo_id_owned,
+                    "test:hello@1.0.0/test/slow",
+                    Bytes::from_static(b"DROP"),
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let bravo_inner = Arc::clone(fix.bravo_transport.inner());
+    bravo_inner.endpoint().close().await;
+
+    // Drain the call task so the post-error eviction runs.
+    let result = timeout(Duration::from_secs(15), call_handle)
+        .await
+        .context("call wedged after server shutdown")?
+        .context("join")?;
+    assert!(
+        result.is_err(),
+        "call must error after mid-RPC server shutdown",
+    );
+
+    // 3. After the eviction code runs, the cache should be empty.
+    let cache_len_after_error = alpha_inner.conn_cache_len().await;
+    assert_eq!(
+        cache_len_after_error, 0,
+        "transport error must trigger eviction so the (peer, alpn) cache is empty",
+    );
+
     Ok(())
 }
