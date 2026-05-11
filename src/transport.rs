@@ -146,7 +146,7 @@ impl IrohTransportClient {
     /// its public surface — e.g. `peer_table().insert(...)` during
     /// test setup).
     #[must_use]
-    pub fn inner(&self) -> &Arc<nerw_core::client::Client> {
+    pub const fn inner(&self) -> &Arc<nerw_core::client::Client> {
         &self.inner
     }
 

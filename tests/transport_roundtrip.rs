@@ -717,7 +717,7 @@ struct ErroringHandler;
 impl MethodHandler for ErroringHandler {
     async fn handle(&self, _ctx: RpcContext, _request: Bytes) -> RpcResult<Bytes> {
         Err(RpcError::Handler(
-            "domain failure: invalid input".to_string().into(),
+            "domain failure: invalid input".to_owned().into(),
         ))
     }
 }

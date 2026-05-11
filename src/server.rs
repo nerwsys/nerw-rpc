@@ -152,7 +152,7 @@ impl RpcServer {
 
     /// Borrow the method registry (test introspection).
     #[must_use]
-    pub fn registry(&self) -> &Arc<MethodRegistry> {
+    pub const fn registry(&self) -> &Arc<MethodRegistry> {
         &self.registry
     }
 
@@ -360,7 +360,7 @@ async fn dispatch_unary(
 ) -> RpcResult<Bytes> {
     let opcode = *buf
         .first()
-        .ok_or_else(|| RpcError::MalformedFrame("empty request frame".to_string()))?;
+        .ok_or_else(|| RpcError::MalformedFrame("empty request frame".to_owned()))?;
     if opcode != OPCODE_UNARY_REQUEST {
         return Err(RpcError::MalformedFrame(format!(
             "expected unary-request opcode 0x{OPCODE_UNARY_REQUEST:02x}, got 0x{opcode:02x}",
@@ -371,7 +371,7 @@ async fn dispatch_unary(
     // measure how many bytes were consumed by the method-name prefix
     // and slice the postcard payload as а zero-copy `Bytes`.
     let (method_name, payload_slice) = decode_method_name(&buf[1..])?;
-    let method_name = method_name.to_string();
+    let method_name = method_name.to_owned();
     let consumed_prefix = buf.len() - payload_slice.len();
     let payload = buf.slice(consumed_prefix..);
 

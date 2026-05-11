@@ -73,8 +73,8 @@ impl MethodName {
     pub fn parse(s: &str) -> Option<Self> {
         let mut parts = s.splitn(3, '/');
         let pkg_part = parts.next()?;
-        let interface = parts.next()?.to_string();
-        let method = parts.next()?.to_string();
+        let interface = parts.next()?.to_owned();
+        let method = parts.next()?.to_owned();
 
         if pkg_part.is_empty() || interface.is_empty() || method.is_empty() {
             return None;
@@ -89,10 +89,10 @@ impl MethodName {
                 }
                 (pkg, Some(ver))
             }
-            None => (pkg_part.to_string(), None),
+            None => (pkg_part.to_owned(), None),
         };
 
-        Some(MethodName {
+        Some(Self {
             package,
             version,
             interface,
@@ -148,7 +148,7 @@ impl MethodRegistry {
             parsed.version.is_some(),
             "registered handlers must include version: got {canonical_name}"
         );
-        self.handlers.insert(canonical_name.to_string(), handler);
+        self.handlers.insert(canonical_name.to_owned(), handler);
     }
 
     /// Lookup a handler by canonical name.
@@ -201,7 +201,7 @@ mod tests {
     fn parse_pinned_method_name() {
         let n = MethodName::parse("tolki:chat@1.0.0/chat/send-message").expect("parse");
         assert_eq!(n.package, "tolki:chat");
-        assert_eq!(n.version, Some("1.0.0".to_string()));
+        assert_eq!(n.version, Some("1.0.0".to_owned()));
         assert_eq!(n.interface, "chat");
         assert_eq!(n.method, "send-message");
     }

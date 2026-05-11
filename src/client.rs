@@ -138,7 +138,7 @@ impl RpcClient {
 fn decode_response_frame(buf: &Bytes) -> RpcResult<Bytes> {
     let opcode = *buf
         .first()
-        .ok_or_else(|| RpcError::MalformedFrame("empty response frame".to_string()))?;
+        .ok_or_else(|| RpcError::MalformedFrame("empty response frame".to_owned()))?;
     match opcode {
         OPCODE_UNARY_RESPONSE => Ok(buf.slice(1..)),
         OPCODE_UNARY_ERROR => {
@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn decode_response_frame_error_handler() {
         let body = postcard::to_allocvec(&WireError::HandlerError {
-            display: "some handler failure".to_string(),
+            display: "some handler failure".to_owned(),
         })
         .expect("encode");
         let buf = build_buf(OPCODE_UNARY_ERROR, &body);
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn decode_response_frame_error_unknown_method() {
         let body = postcard::to_allocvec(&WireError::UnknownMethod {
-            method_name: "tolki:nope@1.0.0/iface/method".to_string(),
+            method_name: "tolki:nope@1.0.0/iface/method".to_owned(),
         })
         .expect("encode");
         let buf = build_buf(OPCODE_UNARY_ERROR, &body);
@@ -206,8 +206,8 @@ mod tests {
         // even when the human-readable Display would not survive а string-prefix
         // match (e.g. translated к Russian).
         let body = postcard::to_allocvec(&WireError::VersionMismatch {
-            requested: "9.9.9".to_string(),
-            available: vec!["1.0.0".to_string(), "2.0.0".to_string()],
+            requested: "9.9.9".to_owned(),
+            available: vec!["1.0.0".to_owned(), "2.0.0".to_owned()],
         })
         .expect("encode");
         let buf = build_buf(OPCODE_UNARY_ERROR, &body);
@@ -218,7 +218,7 @@ mod tests {
                 available,
             } => {
                 assert_eq!(requested, "9.9.9");
-                assert_eq!(available, vec!["1.0.0".to_string(), "2.0.0".to_string()]);
+                assert_eq!(available, vec!["1.0.0".to_owned(), "2.0.0".to_owned()]);
             }
             other => panic!("expected RpcError::VersionMismatch, got {other:?}"),
         }

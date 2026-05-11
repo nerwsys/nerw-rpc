@@ -92,7 +92,7 @@ pub fn decode_method_name(input: &[u8]) -> RpcResult<(&str, &[u8])> {
         .is_none_or(|end| end > input.len())
     {
         return Err(RpcError::MalformedFrame(
-            "method-name length exceeds buffer".to_string(),
+            "method-name length exceeds buffer".to_owned(),
         ));
     }
     let name = std::str::from_utf8(&input[consumed..consumed + name_len])
