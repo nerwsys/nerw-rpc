@@ -31,7 +31,7 @@ async-trait = "0.1"
 # of the published crate cannot accidentally pull а semver-incompatible
 # iroh patch into the same dependency tree.
 iroh = "0.98"
-nerw-core = { path = "/src/nerw/crates/nerw-core" }
+nerw-core = { git = "ssh://git@github.com/nerwsys/nerw", branch = "main" }
 parking_lot = "0.12"
 
 # DashMap — concurrent hash map keyed by stream-id для DatagramDispatcher.
@@ -54,7 +54,7 @@ rcgen = "0.14"
 # builds never expose internal cache state. The feature is dev-only —
 # `dev-dependencies` recompiles `nerw-core` only for the test binaries,
 # не the library itself.
-nerw-core = { path = "/src/nerw/crates/nerw-core", features = ["test-utils"] }
+nerw-core = { git = "ssh://git@github.com/nerwsys/nerw", branch = "main", features = ["test-utils"] }
 
 [lints.rust]
 # nerw-rpc уже `unsafe_code = "forbid"` — strictly stronger чем /src/tolki "warn", сохраняем
