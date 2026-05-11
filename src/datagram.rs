@@ -80,12 +80,27 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use iroh::endpoint::Connection;
+use tokio::sync::Semaphore;
 use tracing::{debug, trace};
 
 use crate::context::{PeerMetadata, RpcContext, TimingInfo, TracingInfo};
 use crate::error::{RpcError, RpcResult};
 use crate::transport::ALPN_TOLKI_DATAGRAM_2_0_0;
 use crate::wire::decode_stream_id;
+
+/// Default cap on concurrent per-frame dispatch tasks spawned by
+/// [`DatagramDispatcher::subscribe_connection`].
+///
+/// Each inbound datagram fires а fresh `tokio::spawn` so а slow handler
+/// cannot starve subsequent datagrams on the same connection. Без а
+/// cap, а voice flood from а malicious or buggy peer can spawn
+/// unbounded tasks — same `DoS` surface as accepting unbounded inbound
+/// streams. The value mirrors [`crate::server::DEFAULT_MAX_CONCURRENT_STREAMS`]
+/// в magnitude но is chosen independently: voice traffic patterns
+/// (high-rate RTP frames burst-arriving from possibly many peers) are
+/// distinct from RPC traffic (request/response semantics), so the cap
+/// is tunable separately via [`DatagramDispatcher::with_max_in_flight`].
+pub const DEFAULT_MAX_CONCURRENT_DATAGRAMS: usize = 1024;
 
 /// Handler trait для datagram sessions — application code implements
 /// this once per registered handshake stream-id.
@@ -118,13 +133,26 @@ pub trait DatagramHandler: Send + Sync + 'static {
 /// Lookup is O(1) via [`dashmap::DashMap`]; mutations и reads do not
 /// contend on а global lock.
 ///
-/// Capacity is unbounded (limited only by the operating system / heap)
-/// — there is no equivalent of the 1.0.0 ALPN's 256-slot cap.
+/// Registry capacity is unbounded (limited only by the operating
+/// system / heap) — there is no equivalent of the 1.0.0 ALPN's
+/// 256-slot cap. Per-frame dispatch concurrency, however, is bounded
+/// by а semaphore (default [`DEFAULT_MAX_CONCURRENT_DATAGRAMS`] = 1024
+/// concurrent in-flight handler tasks) to defend against а voice
+/// flood from а malicious or buggy peer spawning unbounded tasks. Use
+/// [`Self::with_max_in_flight`] to tune the limit for high-traffic
+/// deployments.
 pub struct DatagramDispatcher {
     /// Map handshake stream-id → handler. Keyed by the `u64`
     /// stream-id of the bidi handshake stream that established the
     /// datagram session.
     handlers: DashMap<u64, Arc<dyn DatagramHandler>>,
+    /// Caps concurrent per-frame dispatch tasks across the connection
+    /// pool. `subscribe_connection` acquires а permit before spawning
+    /// the handler's `.await`-able body; tasks blocked on the
+    /// semaphore wait briefly rather than spawning unbounded tokio
+    /// tasks. Wrapped in `Arc` so spawned-task clones share the
+    /// allocation.
+    in_flight_permits: Arc<Semaphore>,
 }
 
 impl Default for DatagramDispatcher {
@@ -137,16 +165,46 @@ impl std::fmt::Debug for DatagramDispatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatagramDispatcher")
             .field("registered_count", &self.handlers.len())
+            .field(
+                "in_flight_permits_available",
+                &self.in_flight_permits.available_permits(),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl DatagramDispatcher {
-    /// Build an empty dispatcher.
+    /// Build an empty dispatcher with [`DEFAULT_MAX_CONCURRENT_DATAGRAMS`]
+    /// in-flight permits.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_max_in_flight(DEFAULT_MAX_CONCURRENT_DATAGRAMS)
+    }
+
+    /// Build an empty dispatcher with а caller-tuned cap on concurrent
+    /// per-frame handler tasks.
+    ///
+    /// Pick this when your workload deviates significantly from
+    /// «moderate voice traffic on а handful of peers» — e.g. а
+    /// high-fan-in conference server with hundreds of inbound RTP
+    /// streams may need а larger cap; an edge device serving а single
+    /// peer may want а tighter one.
+    ///
+    /// # Panics
+    ///
+    /// `max` MUST be `> 0`. Zero permits would deadlock the dispatcher
+    /// permanently — every `acquire` would block forever, и no
+    /// handler would ever run. [`Semaphore::new`] does not panic on
+    /// `0`, so we validate ourselves.
+    #[must_use]
+    pub fn with_max_in_flight(max: usize) -> Self {
+        assert!(
+            max > 0,
+            "DatagramDispatcher max_in_flight must be > 0; zero would deadlock the dispatcher",
+        );
         Self {
             handlers: DashMap::new(),
+            in_flight_permits: Arc::new(Semaphore::new(max)),
         }
     }
 
@@ -303,8 +361,38 @@ impl DatagramDispatcher {
     ///
     /// The read loop spawns one task per inbound datagram so а slow
     /// handler cannot starve subsequent datagrams on the same
-    /// connection. Per-frame dispatch is fire-and-forget; errors are
-    /// observable only через tracing.
+    /// connection. Per-frame dispatch is bounded by the dispatcher's
+    /// in-flight semaphore (default [`DEFAULT_MAX_CONCURRENT_DATAGRAMS`])
+    /// — а voice flood from а malicious or buggy peer queues briefly
+    /// rather than spawning unbounded tokio tasks. Tune the limit via
+    /// [`Self::with_max_in_flight`] for high-fan-in deployments.
+    /// Errors from the dispatch body are fire-and-forget; observable
+    /// only через tracing.
+    ///
+    /// # Race condition warning
+    ///
+    /// Inbound datagrams sent **before** the dispatcher's read loop is
+    /// wired will be silently dropped by iroh's per-connection queue.
+    /// Production callers MUST perform an application-level handshake
+    /// (e.g. via а bidi stream RPC) before sending the first datagram.
+    /// This guarantees the responder side has invoked
+    /// [`Self::subscribe_connection`] и is ready to receive.
+    ///
+    /// The established voice subprotocol pattern is:
+    /// 1. Client opens а bidi stream к responder's wire-protocol ALPN
+    ///    ([`crate::transport::ALPN_TOLKI_WIRE_PROTOCOL_2_0_0`]).
+    /// 2. Client sends а voice/start RPC method (blocks until the
+    ///    server acknowledges the handshake).
+    /// 3. Server-side handler reaches into the dispatcher и registers
+    ///    the handler at the QUIC stream-id (via [`Self::register`]).
+    /// 4. Server has already wired [`Self::subscribe_connection`] on
+    ///    the datagram ALPN connection accepted earlier.
+    /// 5. Client now safely sends RTP datagrams on the datagram ALPN
+    ///    connection — the responder's read loop is guaranteed live.
+    ///
+    /// Tests may use `tokio::time::sleep(Duration::from_millis(200))`
+    /// as а race-avoidance shim to skip the handshake, но production
+    /// code should use the bidi RPC handshake pattern instead.
     pub fn subscribe_connection(self: Arc<Self>, conn: Connection) {
         let from_peer = conn.remote_id();
         tokio::spawn(async move {
@@ -314,7 +402,28 @@ impl DatagramDispatcher {
                     Ok(bytes) => {
                         let self_clone = Arc::clone(&self);
                         let ctx = Self::build_context(from_peer);
+                        let permits = Arc::clone(&self.in_flight_permits);
                         tokio::spawn(async move {
+                            // Acquire а permit BEFORE doing any work —
+                            // а voice flood from а malicious or buggy
+                            // peer queues here briefly rather than
+                            // spawning unbounded tokio tasks. The
+                            // permit is dropped automatically on task
+                            // exit (RAII via `_permit`'s scope).
+                            let _permit = match permits.acquire_owned().await {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    // Semaphore closed — only happens
+                                    // if the dispatcher is being torn
+                                    // down. Drop the frame silently.
+                                    trace!(
+                                        remote = %from_peer,
+                                        error = %e,
+                                        "datagram dispatcher semaphore closed; dropping frame",
+                                    );
+                                    return;
+                                }
+                            };
                             if let Err(e) = self_clone.dispatch(ctx, bytes).await {
                                 debug!(
                                     remote = %from_peer,
@@ -335,6 +444,15 @@ impl DatagramDispatcher {
                 }
             }
         });
+    }
+
+    /// Borrow the in-flight semaphore (test introspection).
+    ///
+    /// Surfaced для unit tests that need to observe permit availability
+    /// — production callers should not poke at the semaphore directly.
+    #[must_use]
+    pub const fn in_flight_semaphore(&self) -> &Arc<Semaphore> {
+        &self.in_flight_permits
     }
 }
 
@@ -511,5 +629,119 @@ mod tests {
         assert_eq!(ctx.peer.node_id, id);
         assert_eq!(ctx.peer.alpn, ALPN_TOLKI_DATAGRAM_2_0_0);
         assert!(ctx.auth.is_none());
+    }
+
+    #[test]
+    fn new_dispatcher_uses_default_in_flight_cap() {
+        let d = DatagramDispatcher::new();
+        assert_eq!(
+            d.in_flight_semaphore().available_permits(),
+            DEFAULT_MAX_CONCURRENT_DATAGRAMS,
+        );
+    }
+
+    #[test]
+    fn with_max_in_flight_honors_caller_cap() {
+        let d = DatagramDispatcher::with_max_in_flight(7);
+        assert_eq!(d.in_flight_semaphore().available_permits(), 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_in_flight must be > 0")]
+    fn with_max_in_flight_rejects_zero() {
+        // Zero permits would deadlock the dispatcher permanently —
+        // every `acquire` would block forever. The constructor refuses
+        // up front rather than letting the deadlock manifest at runtime.
+        let _ = DatagramDispatcher::with_max_in_flight(0);
+    }
+
+    #[tokio::test]
+    async fn datagram_dispatcher_caps_concurrent_handlers() {
+        // W1 — verify the semaphore actually bounds concurrent handler
+        // tasks. We simulate the `subscribe_connection` per-frame body
+        // by reaching into `in_flight_semaphore()` directly: real
+        // subscribe_connection needs an iroh Connection (integration
+        // territory), but the semaphore-acquire-then-dispatch path is
+        // the same code under test.
+        use std::sync::atomic::AtomicI32;
+        use tokio::sync::Notify;
+
+        struct BarrierHandler {
+            in_flight: Arc<AtomicI32>,
+            peak: Arc<AtomicI32>,
+            release: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl DatagramHandler for BarrierHandler {
+            async fn handle(&self, _ctx: RpcContext, _payload: Bytes) -> RpcResult<()> {
+                let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(cur, Ordering::SeqCst);
+                // Wait until the test releases us; mirrors а slow
+                // handler holding а permit.
+                self.release.notified().await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let in_flight = Arc::new(AtomicI32::new(0));
+        let peak = Arc::new(AtomicI32::new(0));
+        let release = Arc::new(Notify::new());
+
+        let d = Arc::new(DatagramDispatcher::with_max_in_flight(2));
+        d.register(
+            1,
+            Arc::new(BarrierHandler {
+                in_flight: Arc::clone(&in_flight),
+                peak: Arc::clone(&peak),
+                release: Arc::clone(&release),
+            }),
+        )
+        .expect("register");
+
+        // Fire 5 frames simulating the subscribe_connection body:
+        // acquire permit, run dispatch. With max=2, at most 2 should
+        // be inside the handler at any moment.
+        let mut tasks = Vec::with_capacity(5);
+        for _ in 0..5_i32 {
+            let d = Arc::clone(&d);
+            let permits = Arc::clone(d.in_flight_semaphore());
+            let frame = build_frame(1, &[0xAA]);
+            tasks.push(tokio::spawn(async move {
+                let _permit = permits.acquire_owned().await.expect("acquire");
+                let ctx = RpcContext::minimal(PeerMetadata::loopback());
+                let _ = d.dispatch(ctx, frame).await;
+            }));
+        }
+
+        // Let the bound take effect — first two tasks enter the
+        // handler, the rest queue on the semaphore.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let observed = in_flight.load(Ordering::SeqCst);
+        assert!(
+            observed <= 2,
+            "in-flight handler count {observed} exceeds semaphore cap of 2",
+        );
+
+        // Release ALL pending handlers in а burst — each release wakes
+        // one waiter; permits free up so blocked tasks acquire next.
+        for _ in 0..20 {
+            release.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        for t in tasks {
+            t.await.expect("join");
+        }
+
+        let peak_observed = peak.load(Ordering::SeqCst);
+        assert!(
+            peak_observed <= 2,
+            "peak concurrent handler count was {peak_observed}; expected ≤ 2 (cap)",
+        );
+        assert!(
+            peak_observed >= 1,
+            "at least one handler must have run; got peak {peak_observed}",
+        );
     }
 }

@@ -72,7 +72,7 @@ pub use crate::context::{
     AuthenticatedContext, NodeId, PeerMetadata, RpcContext, SessionInfo, TimingInfo, TracingInfo,
     loopback_node_id,
 };
-pub use crate::datagram::{DatagramDispatcher, DatagramHandler};
+pub use crate::datagram::{DEFAULT_MAX_CONCURRENT_DATAGRAMS, DatagramDispatcher, DatagramHandler};
 pub use crate::error::{RpcError, RpcResult};
 pub use crate::method::{MethodHandler, MethodName, MethodRegistry};
 pub use crate::server::{
