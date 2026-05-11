@@ -380,10 +380,15 @@ async fn datagram_dispatch_roundtrip() -> Result<()> {
         .await
         .context("dial_with_alpn")?;
 
-    // Give bravo's accept loop а moment к pick up the connection и
-    // wire the dispatcher's read loop. Without this, alpha may send
-    // before bravo subscribes и the datagram will be dropped by the
-    // peer-side stack before our loop sees it.
+    // W3 — race-avoidance shim для test only. Production callers MUST
+    // perform an application-level handshake (bidi RPC к the
+    // wire-protocol ALPN) before sending the first datagram, so the
+    // responder's `subscribe_connection` is guaranteed live by the
+    // time the first RTP frame arrives. See
+    // `DatagramDispatcher::subscribe_connection` doc comment для the
+    // canonical voice subprotocol sequence. This sleep stands в for
+    // that handshake — the test exercises the dispatch surface, not
+    // the handshake protocol.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Send а datagram с varint(stream-id) prefix:
@@ -456,6 +461,8 @@ async fn datagram_handshake_correlation_roundtrip() -> Result<()> {
         .await
         .context("dial_with_alpn")?;
 
+    // W3 — race-avoidance shim (see `datagram_dispatch_roundtrip`
+    // and `DatagramDispatcher::subscribe_connection` doc).
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // [varint(1_000_000) | "VOICE-FRAME"]
