@@ -1930,10 +1930,8 @@ checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "nerw-core"
-version = "0.30.4"
+version = "0.31.1"
 dependencies = [
- "blake3",
- "bytes",
  "iroh",
  "iroh-base",
  "libc",
@@ -1947,7 +1945,7 @@ dependencies = [
 
 [[package]]
 name = "nerw-rpc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",

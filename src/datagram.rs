@@ -1,4 +1,4 @@
-//! Datagram dispatch table — stream-id keyed map for voice / unreliable subprotocols.
+//! Datagram dispatch table — stream-id keyed map для voice / unreliable subprotocols.
 //!
 //! ## Voice flow (per `NERW-RPC-DESIGN.md` Section 5)
 //!
@@ -16,15 +16,34 @@
 //!    sees the matching id on the accepted bidi.
 //! 2. Application code registers а [`DatagramHandler`] на the dispatcher
 //!    keyed by that stream-id via [`DatagramDispatcher::register`].
-//! 3. Subsequent RTP frames are sent via
-//!    [`nerw_core::client::Client::send_datagram`] с а `varint(stream-id)`
-//!    prefix instead of the legacy 1-byte token. The varint is decoded
-//!    by [`DatagramDispatcher::dispatch`] using
-//!    [`crate::wire::decode_stream_id`]; the trailing bytes are handed
-//!    к the registered handler.
-//! 4. Datagrams arriving for an unregistered stream-id surface as
+//! 3. Application wires the dispatcher onto а connection via
+//!    [`DatagramDispatcher::subscribe_connection`]. The subscriber
+//!    spawns а per-connection `read_datagram` loop that decodes the
+//!    `varint(stream-id)` prefix и dispatches к the registered handler.
+//! 4. Subsequent RTP frames are sent via
+//!    [`iroh::endpoint::Connection::send_datagram`] с а
+//!    `varint(stream-id)` prefix. The dispatcher's read loop hands
+//!    payload bytes (less the varint prefix) к the registered handler.
+//! 5. Datagrams arriving for an unregistered stream-id surface as
 //!    [`crate::error::RpcError::DatagramStreamIdUnknown`] (visible on
-//!    the broadcast loop's dispatch result).
+//!    the read loop's dispatch result; logged but не surfaced beyond
+//!    that since datagrams are fire-and-forget).
+//!
+//! ## Why explicit `subscribe_connection` (Phase 2.1)
+//!
+//! Pre-R3 nerw-core shipped а `subscribe_datagrams()` broadcast channel
+//! fanning out every inbound datagram across every cached connection.
+//! Post-R3 (commit `48ec369`) that channel is gone — nerw-core's
+//! `Client::accept` is а raw delegation, и
+//! `Connection::read_datagram` is per-connection. nerw-rpc's
+//! [`DatagramDispatcher::subscribe_connection`] takes one connection
+//! (handed in by а custom-ALPN handler on the inbound side, or by
+//! `dial_with_alpn` on the outbound side) и owns the per-connection
+//! read loop. Consumers wire multiple connections к the same
+//! dispatcher; the dispatcher's handler table keys on stream-id, не
+//! on connection identity, так а handshake stream-id collision across
+//! two distinct peers would be ambiguous (intentional — collisions are
+//! caller-managed via [`DatagramDispatcher::register`] failure).
 //!
 //! ## Why stream-id (not а 1-byte token)
 //!
@@ -49,7 +68,7 @@
 //! ## `DashMap` (not а `parking_lot::Mutex<HashMap>`)
 //!
 //! The dispatcher uses [`dashmap::DashMap`] для concurrent O(1) lookup
-//! без а global lock. `DashMap` shards internally по hash, so concurrent
+//! без а global lock. `DashMap` shards internally по hash, так concurrent
 //! `register` / `unregister` / `dispatch` calls touching different
 //! stream-ids do not contend. We never `.await` while holding а
 //! `DashMap` shard guard — the dispatch path clones the `Arc<dyn Handler>`
@@ -60,21 +79,22 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
-use tracing::trace;
+use iroh::endpoint::Connection;
+use tracing::{debug, trace};
 
 use crate::context::{PeerMetadata, RpcContext, TimingInfo, TracingInfo};
 use crate::error::{RpcError, RpcResult};
 use crate::transport::ALPN_TOLKI_DATAGRAM_2_0_0;
 use crate::wire::decode_stream_id;
 
-/// Handler trait for datagram sessions — application code implements
+/// Handler trait для datagram sessions — application code implements
 /// this once per registered handshake stream-id.
 ///
 /// The dispatcher hands the handler the per-frame [`RpcContext`] и the
 /// payload bytes (everything после the leading `varint(stream-id)`
 /// prefix). Handlers MUST return promptly — the dispatcher's caller
-/// drives the inbound datagram broadcast loop, и slow handlers can
-/// starve other sessions sharing the same connection.
+/// drives the inbound datagram read loop, и slow handlers can starve
+/// other sessions sharing the same connection.
 ///
 /// `payload` is а [`Bytes`] view sharing the same underlying allocation
 /// as the inbound datagram — handlers can clone it cheaply (ref-count
@@ -91,7 +111,7 @@ pub trait DatagramHandler: Send + Sync + 'static {
     async fn handle(&self, ctx: RpcContext, payload: Bytes) -> RpcResult<()>;
 }
 
-/// Stream-id keyed dispatch table for inbound datagrams.
+/// Stream-id keyed dispatch table для inbound datagrams.
 ///
 /// Each entry maps а handshake bidi stream-id (`u64`, allocated by
 /// QUIC) к the [`DatagramHandler`] registered for that session.
@@ -138,7 +158,7 @@ impl DatagramDispatcher {
     /// (`u64::from(send.id())` / `u64::from(recv.id())`); client-side
     /// callers from the `open_bi` return value.
     ///
-    /// Note: `quinn_proto::StreamId` wraps `u64` in а tuple struct but
+    /// Note: `quinn_proto::StreamId` wraps `u64` в а tuple struct but
     /// the inner field is not `pub` — use the `From<StreamId> for u64`
     /// conversion (`u64::from(...)`) rather than `.id().0`.
     ///
@@ -182,7 +202,7 @@ impl DatagramDispatcher {
     /// Dispatch one inbound datagram frame:
     /// `[varint(stream-id) | payload]`.
     ///
-    /// `frame` is taken as а [`Bytes`] so the payload slice handed к
+    /// `frame` is taken as а [`Bytes`] так the payload slice handed к
     /// the handler shares the inbound allocation (zero-copy split-off
     /// of the varint prefix).
     ///
@@ -193,7 +213,7 @@ impl DatagramDispatcher {
     /// - [`RpcError::MalformedFrame`] — varint decoded but exceeds
     ///   `u64` (delegated к [`crate::wire::decode_stream_id`]).
     /// - [`RpcError::DatagramStreamIdUnknown`] — no handler registered
-    ///   for the decoded stream-id.
+    ///   для the decoded stream-id.
     /// - Any error returned by the handler itself.
     pub async fn dispatch(&self, ctx: RpcContext, frame: Bytes) -> RpcResult<()> {
         // Empty frame cannot carry а varint at all — surface а
@@ -235,17 +255,15 @@ impl DatagramDispatcher {
         }
     }
 
-    /// Build an [`RpcContext`] suitable for а datagram delivery.
+    /// Build an [`RpcContext`] suitable для а datagram delivery.
     ///
-    /// Used by callers wiring the dispatch loop from
-    /// [`nerw_core::client::Client::subscribe_datagrams`]. The
-    /// [`PeerMetadata::node_id`] is the [`iroh::EndpointId`] copied
-    /// from the inbound `DatagramFrame::from_peer`. The ALPN field
-    /// reflects [`ALPN_TOLKI_DATAGRAM_2_0_0`] regardless of which QUIC
-    /// connection actually carried the datagram — datagrams ride on
-    /// the same connection as nerw RPC (Quinn multiplexes streams +
-    /// datagrams in one session) but logically belong к the
-    /// tolki/datagram/2.0.0 sub-protocol.
+    /// Used by [`Self::subscribe_connection`] и by callers who manually
+    /// wire а connection's `read_datagram` loop. The
+    /// [`PeerMetadata::node_id`] is the [`iroh::EndpointId`] of the
+    /// connection's `remote_id()`. The ALPN field reflects
+    /// [`ALPN_TOLKI_DATAGRAM_2_0_0`] regardless of the carrier connection's
+    /// actual ALPN — datagrams ride multiplexed on QUIC connections и
+    /// the dispatch protocol is unrelated to the bidi-stream ALPN.
     #[must_use]
     pub fn build_context(from_peer: iroh::EndpointId) -> RpcContext {
         let peer = PeerMetadata {
@@ -263,6 +281,60 @@ impl DatagramDispatcher {
             session: None,
             tracing: TracingInfo::fresh(),
         }
+    }
+
+    /// Spawn а per-connection datagram read loop.
+    ///
+    /// Drains [`iroh::endpoint::Connection::read_datagram`] until the
+    /// connection closes, dispatching each frame через [`Self::dispatch`].
+    /// Errors returned from the dispatch path are traced и dropped —
+    /// datagrams are fire-and-forget, so an unknown stream-id or
+    /// handler error does not abort the read loop.
+    ///
+    /// Returns immediately after spawning the loop. The spawned task
+    /// holds an `Arc` clone of the dispatcher; the loop exits naturally
+    /// when `read_datagram` returns `Err` (connection closed / lost).
+    /// Production callers typically invoke this once per connection
+    /// they want to receive datagrams on (inbound: from the
+    /// [`crate::transport::AlpnHandler::handle`] for the datagram ALPN;
+    /// outbound: after `dial_with_alpn` for reply-datagram support).
+    ///
+    /// # Concurrency
+    ///
+    /// The read loop spawns one task per inbound datagram so а slow
+    /// handler cannot starve subsequent datagrams on the same
+    /// connection. Per-frame dispatch is fire-and-forget; errors are
+    /// observable only через tracing.
+    pub fn subscribe_connection(self: Arc<Self>, conn: Connection) {
+        let from_peer = conn.remote_id();
+        tokio::spawn(async move {
+            trace!(remote = %from_peer, "datagram read loop started");
+            loop {
+                match conn.read_datagram().await {
+                    Ok(bytes) => {
+                        let self_clone = Arc::clone(&self);
+                        let ctx = Self::build_context(from_peer);
+                        tokio::spawn(async move {
+                            if let Err(e) = self_clone.dispatch(ctx, bytes).await {
+                                debug!(
+                                    remote = %from_peer,
+                                    error = %e,
+                                    "datagram dispatch returned error",
+                                );
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        trace!(
+                            remote = %from_peer,
+                            error = %e,
+                            "datagram read loop: connection closed",
+                        );
+                        return;
+                    }
+                }
+            }
+        });
     }
 }
 
