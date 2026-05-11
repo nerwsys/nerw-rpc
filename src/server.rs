@@ -372,7 +372,10 @@ async fn dispatch_unary(
     // and slice the postcard payload as а zero-copy `Bytes`.
     let (method_name, payload_slice) = decode_method_name(&buf[1..])?;
     let method_name = method_name.to_owned();
-    let consumed_prefix = buf.len() - payload_slice.len();
+    // `payload_slice` is the tail of `buf[1..]`, so `buf.len() >=
+    // payload_slice.len()`. `saturating_sub` makes that proof-by-construction
+    // immune to a future refactor that could violate the invariant.
+    let consumed_prefix = buf.len().saturating_sub(payload_slice.len());
     let payload = buf.slice(consumed_prefix..);
 
     let handler = registry
@@ -453,7 +456,10 @@ fn build_inbound_context(
 
 /// Frame а success response: `[OPCODE_UNARY_RESPONSE | response_bytes]`.
 async fn write_response(send: &mut iroh::endpoint::SendStream, response: &Bytes) -> RpcResult<()> {
-    let mut buf = BytesMut::with_capacity(1 + response.len());
+    // `saturating_add(1)` for the opcode byte — capacity is а hint, the
+    // BytesMut itself grows on demand, so an unlikely usize overflow here
+    // is harmless. The lint exists to flag silent wrap-around в release.
+    let mut buf = BytesMut::with_capacity(response.len().saturating_add(1));
     buf.put_u8(OPCODE_UNARY_RESPONSE);
     buf.extend_from_slice(response);
     send.write_all(&buf)
@@ -478,7 +484,7 @@ async fn write_response(send: &mut iroh::endpoint::SendStream, response: &Bytes)
 async fn write_error(send: &mut iroh::endpoint::SendStream, err: &RpcError) -> RpcResult<()> {
     let wire = WireError::from_rpc_error(err);
     let body_bytes = postcard::to_allocvec(&wire).map_err(RpcError::Codec)?;
-    let mut buf = BytesMut::with_capacity(1 + body_bytes.len());
+    let mut buf = BytesMut::with_capacity(body_bytes.len().saturating_add(1));
     buf.put_u8(OPCODE_UNARY_ERROR);
     buf.extend_from_slice(&body_bytes);
     send.write_all(&buf)
@@ -503,7 +509,14 @@ async fn write_error(send: &mut iroh::endpoint::SendStream, err: &RpcError) -> R
 /// encoding fails (effectively never for an in-memory `Vec`, kept honest
 /// for forward-compat).
 pub(crate) fn build_unary_request_frame(method_name: &str, request: &Bytes) -> RpcResult<Bytes> {
-    let mut buf = Vec::with_capacity(1 + 5 + method_name.len() + request.len());
+    // 1 opcode byte + ≤5 LEB128 method-len bytes + UTF-8 name + payload.
+    // `saturating_add` keeps the capacity hint sound even на а pathological
+    // `usize::MAX`-near input (which would fail at write time anyway).
+    let mut buf = Vec::with_capacity(
+        6_usize
+            .saturating_add(method_name.len())
+            .saturating_add(request.len()),
+    );
     buf.push(OPCODE_UNARY_REQUEST);
     encode_method_name(method_name, &mut buf)?;
     buf.extend_from_slice(request);

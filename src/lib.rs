@@ -43,6 +43,9 @@
         // `h as Arc<dyn Trait>` upcast в `Arc::ptr_eq` test —
         // unsizing coercion is the language-blessed way.
         clippy::as_conversions,
+        // `Vec::with_capacity(1 + body.len())` test buffer builders.
+        // Overflow path is statically impossible for fixture-sized inputs.
+        clippy::arithmetic_side_effects,
     )
 )]
 

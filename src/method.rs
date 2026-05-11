@@ -82,8 +82,11 @@ impl MethodName {
 
         let (package, version) = match pkg_part.find('@') {
             Some(idx) => {
-                let pkg = pkg_part[..idx].to_string();
-                let ver = pkg_part[idx + 1..].to_string();
+                let pkg = pkg_part[..idx].to_owned();
+                // `idx` is а valid index returned by `find`, so
+                // `idx < pkg_part.len() <= usize::MAX`. `saturating_add`
+                // is а formality к satisfy `arithmetic_side_effects`.
+                let ver = pkg_part[idx.saturating_add(1)..].to_owned();
                 if pkg.is_empty() || ver.is_empty() {
                     return None;
                 }
