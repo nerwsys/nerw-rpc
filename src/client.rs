@@ -30,7 +30,7 @@
 //! has been silently dropped after the cache hit.
 
 use bytes::Bytes;
-use iroh::EndpointId;
+use nerw_core::identity::NodeId;
 use tracing::trace;
 
 use crate::error::{RpcError, RpcResult};
@@ -77,7 +77,13 @@ impl RpcClient {
 
     /// Issue а unary RPC call.
     ///
-    /// `peer` is the target [`EndpointId`] (z-base32 Ed25519 public key).
+    /// `peer` is the target [`NodeId`] (z-base32 Ed25519 public key).
+    /// Today the type aliases к `iroh::EndpointId` / `iroh::PublicKey`;
+    /// post-R4 nerw-core will introduce а `NerwNodeId` newtype wrapper
+    /// и this signature will resolve к the wrapper automatically —
+    /// callers importing [`nerw_core::identity::NodeId`] are
+    /// future-proof.
+    ///
     /// `method_name` follows the canonical text format
     /// `package[@version]/interface/method` (D7 — see module docs).
     /// `request_bytes` is the postcard-encoded request body.
@@ -101,7 +107,7 @@ impl RpcClient {
     /// - [`RpcError::UnknownMethod`]          — server-side registry miss.
     pub async fn call(
         &self,
-        peer: &EndpointId,
+        peer: &NodeId,
         method_name: &str,
         request: Bytes,
     ) -> RpcResult<Bytes> {
@@ -135,7 +141,7 @@ impl RpcClient {
     /// match arms inline.
     async fn call_inner(
         &self,
-        peer: &EndpointId,
+        peer: &NodeId,
         method_name: &str,
         request: Bytes,
     ) -> RpcResult<Bytes> {

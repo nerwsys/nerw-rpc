@@ -317,13 +317,16 @@ impl DatagramDispatcher {
     ///
     /// Used by [`Self::subscribe_connection`] и by callers who manually
     /// wire а connection's `read_datagram` loop. The
-    /// [`PeerMetadata::node_id`] is the [`iroh::EndpointId`] of the
-    /// connection's `remote_id()`. The ALPN field reflects
-    /// [`ALPN_TOLKI_DATAGRAM_2_0_0`] regardless of the carrier connection's
-    /// actual ALPN — datagrams ride multiplexed on QUIC connections и
-    /// the dispatch protocol is unrelated to the bidi-stream ALPN.
+    /// [`PeerMetadata::node_id`] is the [`nerw_core::identity::NodeId`]
+    /// of the connection's `remote_id()` — today the type aliases к
+    /// `iroh::EndpointId`, post-R4 it will resolve к the
+    /// `NerwNodeId` newtype wrapper automatically. The ALPN field
+    /// reflects [`ALPN_TOLKI_DATAGRAM_2_0_0`] regardless of the carrier
+    /// connection's actual ALPN — datagrams ride multiplexed on QUIC
+    /// connections и the dispatch protocol is unrelated to the
+    /// bidi-stream ALPN.
     #[must_use]
-    pub fn build_context(from_peer: iroh::EndpointId) -> RpcContext {
+    pub fn build_context(from_peer: nerw_core::identity::NodeId) -> RpcContext {
         let peer = PeerMetadata {
             node_id: from_peer,
             connection_id: 0,
