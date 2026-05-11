@@ -11,9 +11,26 @@
 //! - **Version omitted** (debug / REPL): `tolki:chat/chat/send-message`
 //!   — the server resolves к the latest registered semver under the same
 //!   `package/interface/method` triple.
+//!
+//! ## Stale-connection eviction (N2)
+//!
+//! `nerw_core::client::Client::open_substream` caches outbound
+//! connections per `(peer, alpn)`. If а cached connection becomes stale
+//! (peer crashed mid-flight; idle timeout; clean close), а subsequent
+//! `open_bi` against the same cache entry surfaces as
+//! [`RpcError::TransportOpenSubstream`] — nerw-core already evicts the
+//! dead entry in that path. nerw-rpc adds а second layer of defence:
+//! when а read or write на an established stream fails
+//! ([`RpcError::TransportRead`] / [`RpcError::TransportWrite`]), the
+//! client explicitly calls
+//! [`nerw_core::client::Client::evict_cached_connection`] so the next
+//! call dials а fresh handshake instead of replaying the dead cache
+//! entry. This handles the corner case where `open_bi` succeeds (it
+//! merely allocates а logical stream id) but the underlying connection
+//! has been silently dropped after the cache hit.
 
 use bytes::Bytes;
-use iroh::EndpointId;
+use nerw_core::identity::NodeId;
 use tracing::trace;
 
 use crate::error::{RpcError, RpcResult};
@@ -34,7 +51,7 @@ const RPC_RESPONSE_READ_LIMIT: usize = 8 * 1024 * 1024;
 /// Wraps а shared [`IrohTransportClient`] handle. Issuing а call opens
 /// (or reuses, via nerw-core's connection cache) а QUIC connection
 /// negotiated с [`ALPN_TOLKI_WIRE_PROTOCOL_2_0_0`], opens а fresh bidi
-/// substream, writes the framed request, and reads the response.
+/// substream, writes the framed request, и reads the response.
 ///
 /// Cloning [`RpcClient`] is cheap — both fields wrap `Arc`s under the
 /// hood. Multiple concurrent calls share the same connection cache.
@@ -60,13 +77,23 @@ impl RpcClient {
 
     /// Issue а unary RPC call.
     ///
-    /// `peer` is the target [`EndpointId`] (z-base32 Ed25519 public key).
+    /// `peer` is the target [`NodeId`] (z-base32 Ed25519 public key).
+    /// Today the type aliases к `iroh::EndpointId` / `iroh::PublicKey`;
+    /// post-R4 nerw-core will introduce а `NerwNodeId` newtype wrapper
+    /// и this signature will resolve к the wrapper automatically —
+    /// callers importing [`nerw_core::identity::NodeId`] are
+    /// future-proof.
+    ///
     /// `method_name` follows the canonical text format
     /// `package[@version]/interface/method` (D7 — see module docs).
     /// `request_bytes` is the postcard-encoded request body.
     ///
     /// Returns the raw response bytes (postcard-decoded by the caller's
     /// generated stub) on success, or а typed [`RpcError`] on failure.
+    ///
+    /// On transport read/write errors the cached connection for
+    /// `(peer, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0)` is evicted so the next
+    /// call re-handshakes (N2 stale-conn defence — see module docs).
     ///
     /// # Errors
     ///
@@ -78,9 +105,38 @@ impl RpcClient {
     ///   body failed (server-side bug).
     /// - [`RpcError::Handler`]                — server returned а handler error.
     /// - [`RpcError::UnknownMethod`]          — server-side registry miss.
-    pub async fn call(
+    pub async fn call(&self, peer: &NodeId, method_name: &str, request: Bytes) -> RpcResult<Bytes> {
+        let result = self.call_inner(peer, method_name, request).await;
+        if let Err(ref err) = result {
+            // N2: evict the cached connection on transport-layer failure
+            // so the next call dials а fresh handshake instead of replaying
+            // а dead cache entry. `open_bi` already handles stale entries
+            // (см. nerw-core's `open_substream`); this catches the case
+            // where the cache hit succeeded но read/write later observed
+            // а silently-dropped connection. Other RpcError variants
+            // (Codec, MalformedFrame, Handler, …) are application-layer
+            // failures on a still-live transport — evicting would force
+            // an unnecessary re-handshake on the next call.
+            if is_transport_io_error(err) {
+                self.transport
+                    .inner()
+                    .evict_cached_connection(peer, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0)
+                    .await;
+                trace!(
+                    peer = %peer,
+                    "RpcClient::call - evicted stale cached connection after transport error",
+                );
+            }
+        }
+        result
+    }
+
+    /// Inner body of [`Self::call`] — separated so the N2 eviction
+    /// post-check can run on every error path без duplicating the
+    /// match arms inline.
+    async fn call_inner(
         &self,
-        peer: &EndpointId,
+        peer: &NodeId,
         method_name: &str,
         request: Bytes,
     ) -> RpcResult<Bytes> {
@@ -101,7 +157,7 @@ impl RpcClient {
             "RpcClient::call - bidi opened, writing request",
         );
 
-        // Write the framed request, signal EOF so the server's
+        // Write the framed request, signal EOF так the server's
         // read_to_end can complete.
         send.write_all(&frame)
             .await
@@ -125,16 +181,36 @@ impl RpcClient {
     }
 }
 
+/// Predicate: is this error а transport-layer read or write failure
+/// that warrants evicting the cached connection (N2 stale-conn defence)?
+///
+/// Returns `true` for [`RpcError::TransportRead`] и
+/// [`RpcError::TransportWrite`] — those are the only variants surfaced
+/// when an established stream observes а silently-dropped connection.
+/// `TransportOpenSubstream` is **not** included here: it already triggers
+/// nerw-core's own eviction в the `open_bi` failure path, so doing it
+/// twice would be redundant и could mask а real peer-not-found bug
+/// surfacing on the next call. All other variants (`Codec`,
+/// `MalformedFrame`, `Handler`, `UnknownMethod`, …) indicate а live
+/// connection с an application-layer fault и must NOT force а
+/// re-handshake.
+const fn is_transport_io_error(err: &RpcError) -> bool {
+    matches!(
+        err,
+        RpcError::TransportRead { .. } | RpcError::TransportWrite { .. }
+    )
+}
+
 /// Decode а response frame: `[OPCODE_UNARY_RESPONSE | bytes]` (success)
 /// or `[OPCODE_UNARY_ERROR | postcard(WireError)]` (failure).
 ///
 /// The error body is the typed [`WireError`] envelope — а 1-byte
 /// discriminant followed by the postcard-encoded payload. Reconstruction
 /// is total: every wire variant maps к а concrete [`RpcError`] variant
-/// without ambiguity. Locale invariant — translating display strings
+/// без ambiguity. Locale invariant — translating display strings
 /// в Russian (or anywhere else) does not affect classification.
 ///
-/// Takes the response frame by reference so the success path can
+/// Takes the response frame by reference так the success path can
 /// `Bytes::slice` off the opcode byte without copying — the returned
 /// [`Bytes`] shares the same underlying allocation as `buf`.
 fn decode_response_frame(buf: &Bytes) -> RpcResult<Bytes> {

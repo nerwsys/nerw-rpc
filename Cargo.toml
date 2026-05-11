@@ -1,6 +1,6 @@
 [package]
 name = "nerw-rpc"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Mesh-agnostic RPC framework over iroh with WIT contracts + postcard wire format"
@@ -49,6 +49,12 @@ tokio = { version = "1", features = ["full", "test-util"] }
 serde_test = "1.0"
 tempfile = "3.10"
 rcgen = "0.14"
+# `test-utils` enables `Client::conn_cache_len()` для test introspection
+# (N2 stale-conn eviction test). Gated behind а feature so production
+# builds never expose internal cache state. The feature is dev-only —
+# `dev-dependencies` recompiles `nerw-core` only for the test binaries,
+# не the library itself.
+nerw-core = { path = "/src/nerw/crates/nerw-core", features = ["test-utils"] }
 
 [lints.rust]
 # nerw-rpc уже `unsafe_code = "forbid"` — strictly stronger чем /src/tolki "warn", сохраняем

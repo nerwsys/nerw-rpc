@@ -1,28 +1,34 @@
 //! [`RpcServer`] — the inbound-side of nerw-rpc.
 //!
-//! Registers an [`nerw_core::client::AlpnHandler`] for
-//! [`crate::transport::ALPN_TOLKI_WIRE_PROTOCOL_2_0_0`] and dispatches
-//! inbound bidi streams к а shared [`crate::method::MethodRegistry`].
+//! Owns an internal ALPN dispatch table и drives nerw-core's accept
+//! loop directly. Inbound connections matching
+//! [`crate::transport::ALPN_TOLKI_WIRE_PROTOCOL_2_0_0`] are dispatched
+//! к the private wire-protocol handler, which decodes per-stream RPC
+//! frames against а shared [`crate::method::MethodRegistry`]. Advanced
+//! callers can additionally register their own
+//! [`crate::transport::AlpnHandler`]s for application-specific ALPNs
+//! they declared upfront via
+//! [`nerw_core::client::ClientConfigBuilder::with_alpn`].
 //!
 //! ## Inbound flow (per stream)
 //!
 //! 1. Peer opens а bidi substream к our [`iroh::Endpoint`] negotiated с
 //!    `tolki/wire-protocol/2.0.0`.
-//! 2. nerw-core's accept loop dispatches the connection к the internal
+//! 2. The server's accept loop dispatches the connection к the internal
 //!    wire-dispatch handler via the [`AlpnHandler`] trait.
 //! 3. The handler spawns а per-connection task that pumps `accept_bi()`
 //!    в а loop. Each accepted bidi stream becomes а fresh
 //!    request-handling task.
 //! 4. Per-stream task reads the request frame:
 //!    `[opcode_unary_request | varint(name_len) | method-name UTF-8 | postcard(payload)]`
-//! 5. Looks up the handler in the [`MethodRegistry`].
+//! 5. Looks up the handler в the [`MethodRegistry`].
 //! 6. Builds an [`RpcContext`] from the connection's
 //!    [`iroh::endpoint::Connection::remote_id`] и timing.
 //! 7. Invokes the handler.
 //! 8. Writes the response: `[opcode_response | postcard(bytes)]`
 //!    on success, or `[opcode_error | postcard(error-string)]` on
 //!    failure (handler error / unknown method / decode error).
-//! 9. Calls `SendStream::finish()` so the peer's `read_to_end` returns.
+//! 9. Calls `SendStream::finish()` так что the peer's `read_to_end` returns.
 //!
 //! ## Why а fresh task per stream
 //!
@@ -30,21 +36,35 @@
 //! request is independent. Spawning per-stream lets concurrent
 //! requests on the same connection (long-running handler + quick poll)
 //! не block each other.
+//!
+//! ## Why а server-owned accept loop (Phase 2.1)
+//!
+//! After R3 (commit `48ec369`) nerw-core no longer owns an internal
+//! accept loop / handler registry — `Client::accept` is а raw
+//! delegation к `iroh::Endpoint::accept`. [`RpcServer`] drives that
+//! surface directly, dispatching by ALPN against an internal
+//! [`DashMap<Vec<u8>, Arc<dyn AlpnHandler>>`]. nerw-daemon's wire layer
+//! does the same dance for the mesh-control protocols — the two
+//! dispatchers are intentionally independent so RPC framework consumers
+//! не link the daemon crate.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
+use dashmap::DashMap;
 use iroh::endpoint::Connection;
-use nerw_core::client::AlpnHandler;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
 
 use crate::context::{PeerMetadata, RpcContext, TimingInfo, TracingInfo};
 use crate::error::{RpcError, RpcResult};
 use crate::method::MethodRegistry;
-use crate::transport::{ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, IrohTransportClient};
+use crate::transport::{ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, AlpnHandler, IrohTransportClient};
 use crate::wire::{
     OPCODE_UNARY_ERROR, OPCODE_UNARY_REQUEST, OPCODE_UNARY_RESPONSE, decode_method_name,
     encode_method_name,
@@ -78,6 +98,16 @@ pub const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 256;
 /// preserving correctness while bounding resource usage.
 pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
+/// QUIC application-layer close code: peer attempted а connection on
+/// an ALPN with no registered handler. The inbound side closes the
+/// connection immediately so the peer learns the protocol is unbound
+/// rather than hanging on а silently-discarded handshake.
+///
+/// Surfaced as а named constant so future close-code allocations are
+/// visible в one place, and accidental collisions across call sites
+/// fail at compile time.
+const CLOSE_NO_HANDLER: u32 = 1;
+
 /// Tunable knobs for [`RpcServer`].
 ///
 /// All defaults are conservative: large enough к keep production traffic
@@ -106,21 +136,67 @@ impl Default for RpcServerConfig {
     }
 }
 
-/// Server-side dispatcher для bidi RPC streams.
+/// Server-side dispatcher для inbound iroh connections.
 ///
 /// Owns the shared [`IrohTransportClient`] handle plus the
 /// [`MethodRegistry`] populated by application code. Call [`Self::serve`]
-/// once at startup к register the inbound handler с nerw-core's
-/// accept loop.
+/// once at startup к bind the wire-protocol handler и spawn the
+/// accept loop; advanced callers can additionally register their own
+/// [`AlpnHandler`]s via [`Self::register_alpn_handler`] before serving.
+///
+/// The accept loop runs as long as the underlying iroh endpoint is open
+/// — calling [`nerw_core::client::Client::shutdown`] terminates it
+/// gracefully.  Dropping the server aborts the loop task immediately;
+/// production callers should keep the [`RpcServer`] alive for the
+/// lifetime of the endpoint.
 pub struct RpcServer {
-    /// Iroh-backed transport handle shared with the accept loop.
+    /// Iroh-backed transport handle shared с the accept loop.
     transport: IrohTransportClient,
     /// Per-method handler registry populated by application code at
     /// startup. `Arc` because the accept loop spawns one task per
-    /// connection and each task needs а cheap clone.
+    /// connection и each task needs а cheap clone.
     registry: Arc<MethodRegistry>,
     /// Concurrency limits + timeout configuration (see [`RpcServerConfig`]).
     config: RpcServerConfig,
+    /// Internal ALPN dispatch table — keyed by negotiated ALPN bytes.
+    /// [`Self::serve`] installs the built-in wire-protocol handler;
+    /// callers can add more via [`Self::register_alpn_handler`].
+    alpn_handlers: Arc<DashMap<Vec<u8>, Arc<dyn AlpnHandler>>>,
+    /// Handle к the spawned accept loop task, wrapped в а sync mutex
+    /// so [`Self::serve`] takes `&self` (not `&mut self`) и preserves
+    /// the Phase 2 public API. `None` before [`Self::serve`] runs;
+    /// `Some` afterwards. Aborted on `Drop` so the loop exits cleanly
+    /// с the server.
+    ///
+    /// **Mutex choice rationale:** [`std::sync::Mutex`] (not
+    /// [`once_cell::sync::OnceCell`]) — `serve()` returns
+    /// [`RpcError::AlreadyServing`] on the second call rather than
+    /// panicking, so the slot is logically «check-and-fill» с а typed
+    /// failure path. The mutex is locked exactly twice over the server's
+    /// lifetime (once в [`Self::serve`], once в [`Drop`]); contention
+    /// is statically impossible — no two threads ever race on it.
+    accept_loop: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for RpcServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `accept_loop` is а sync mutex; lock briefly to read the slot.
+        // А poisoned guard still yields `Some`/`None` correctly — we
+        // use `.lock().ok()` so Debug never panics on poisoning, which
+        // would mask the real failure being formatted.
+        let running = self
+            .accept_loop
+            .lock()
+            .ok()
+            .as_deref()
+            .is_some_and(Option::is_some);
+        f.debug_struct("RpcServer")
+            .field("transport", &self.transport)
+            .field("config", &self.config)
+            .field("registered_alpns", &self.alpn_handlers.len())
+            .field("accept_loop_running", &running)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RpcServer {
@@ -128,7 +204,7 @@ impl RpcServer {
     /// using [`RpcServerConfig::default`] limits.
     ///
     /// Does NOT start dispatching yet — call [`Self::serve`] once к
-    /// register the ALPN handler с nerw-core.
+    /// install the wire-protocol handler и spawn the accept loop.
     #[must_use]
     pub fn new(transport: IrohTransportClient, registry: Arc<MethodRegistry>) -> Self {
         Self::with_config(transport, registry, RpcServerConfig::default())
@@ -136,10 +212,10 @@ impl RpcServer {
 
     /// Wire up the server с custom limits.
     ///
-    /// Use this when you know your workload pattern and want к override
+    /// Use this when you know your workload pattern и want к override
     /// [`DEFAULT_MAX_CONCURRENT_STREAMS`] / [`DEFAULT_MAX_CONCURRENT_CONNECTIONS`].
     #[must_use]
-    pub const fn with_config(
+    pub fn with_config(
         transport: IrohTransportClient,
         registry: Arc<MethodRegistry>,
         config: RpcServerConfig,
@@ -148,6 +224,8 @@ impl RpcServer {
             transport,
             registry,
             config,
+            alpn_handlers: Arc::new(DashMap::new()),
+            accept_loop: Mutex::new(None),
         }
     }
 
@@ -169,52 +247,198 @@ impl RpcServer {
         &self.config
     }
 
-    /// Register the wire-protocol handler с nerw-core's accept loop.
-    ///
-    /// Idempotent — calling twice replaces the previous handler с а
-    /// fresh one bound to the same registry. The ALPN
-    /// [`ALPN_TOLKI_WIRE_PROTOCOL_2_0_0`] MUST have been declared в
+    /// Number of currently-registered [`AlpnHandler`]s (test
+    /// introspection). Includes the built-in wire-protocol handler
+    /// once [`Self::serve`] has been called.
+    #[must_use]
+    pub fn registered_alpn_count(&self) -> usize {
+        self.alpn_handlers.len()
+    }
+
+    /// Register an additional [`AlpnHandler`] для an application-specific
+    /// ALPN. The ALPN MUST have been declared upfront via
     /// [`nerw_core::client::ClientConfigBuilder::with_alpn`] before
+    /// [`nerw_core::client::Client::start`] — iroh's rustls server config
+    /// locks the ALPN list at builder time.
+    ///
+    /// Calling this with the wire-protocol ALPN overwrites the built-in
+    /// handler — almost certainly а bug, so the framework does not
+    /// special-case the collision (the second insertion wins silently,
+    /// which is intentional: replacing the wire handler is а legitimate
+    /// (if rare) test-fixture use case).
+    pub fn register_alpn_handler(&self, alpn: &[u8], handler: Arc<dyn AlpnHandler>) {
+        self.alpn_handlers.insert(alpn.to_vec(), handler);
+    }
+
+    /// Install the wire-protocol handler и spawn the accept loop.
+    ///
+    /// Takes `&self` so callers can keep the server behind an `Arc` —
+    /// the accept-loop [`JoinHandle`] lives behind an internal
+    /// [`std::sync::Mutex`]. Calling [`Self::serve`] а second time on
+    /// the same instance returns [`RpcError::AlreadyServing`] rather
+    /// than spawning а duplicate loop (two loops would race on
+    /// `Client::accept` и leak the prior handle).
+    ///
+    /// The ALPN [`ALPN_TOLKI_WIRE_PROTOCOL_2_0_0`] MUST have been declared
+    /// в [`nerw_core::client::ClientConfigBuilder::with_alpn`] before
     /// [`nerw_core::client::Client::start`] — runtime extension is not
     /// supported (iroh locks the rustls server config's ALPN list at
-    /// builder time).
+    /// builder time). Inbound connections with an undeclared ALPN are
+    /// dropped by iroh before they reach our handler table.
     ///
     /// # Errors
     ///
-    /// - [`RpcError::TransportRegisterAlpn`] when nerw-core rejects the
-    ///   registration (ALPN was not pre-declared, or it conflicts с а
-    ///   built-in nerw protocol — the message identifies which case).
+    /// - [`RpcError::AlreadyServing`] — [`Self::serve`] has already
+    ///   spawned an accept loop on this instance. Spawning а second
+    ///   loop would leak the prior `JoinHandle` and race on
+    ///   `Client::accept`.
+    ///
+    /// The method remains `async` so future variants (e.g. binding to
+    /// multiple endpoints, validating that ALPNs are pre-declared) can
+    /// surface errors без а wire-breaking change. Phase 2's
+    /// implementation awaited `register_alpn_handler` (now gone); the
+    /// async signature is preserved so consumers calling
+    /// `.serve().await` continue compiling без а wire-breaking change.
+    /// Clippy's `unused_async` lint is suppressed at the call site.
+    #[allow(clippy::unused_async)]
     pub async fn serve(&self) -> RpcResult<()> {
-        let handler: Arc<dyn AlpnHandler> = Arc::new(WireDispatchHandler {
+        // Reserve the accept-loop slot BEFORE installing the wire
+        // handler so а second `serve()` call cannot leave the handler
+        // table partially mutated. The mutex is locked briefly only
+        // for the check-and-fill; no .await happens while holding it.
+        //
+        // Mutex poisoning surfaces as а panic here only if а prior
+        // panic was caught mid-mutation — а separate bug deserving its
+        // own crash report. We propagate via `expect` rather than
+        // returning а typed error: there is no recoverable action а
+        // caller can take, и the poisoning itself is the diagnostic.
+        #[allow(clippy::expect_used)] // Poisoning = unrecoverable bug; see above.
+        let mut slot = self
+            .accept_loop
+            .lock()
+            .expect("RpcServer accept_loop mutex poisoned");
+        if slot.is_some() {
+            return Err(RpcError::AlreadyServing);
+        }
+
+        // Install the built-in wire-protocol handler.
+        let wire_handler: Arc<dyn AlpnHandler> = Arc::new(WireDispatchHandler {
             registry: Arc::clone(&self.registry),
             stream_permits: Arc::new(Semaphore::new(self.config.max_concurrent_streams)),
             connection_permits: Arc::new(Semaphore::new(self.config.max_concurrent_connections)),
             connection_id_counter: Arc::new(AtomicU64::new(1)),
         });
-        self.transport
-            .inner()
-            .register_alpn_handler(ALPN_TOLKI_WIRE_PROTOCOL_2_0_0.to_vec(), handler)
-            .await
-            .map_err(|e| RpcError::TransportRegisterAlpn {
-                alpn: String::from_utf8_lossy(ALPN_TOLKI_WIRE_PROTOCOL_2_0_0).into_owned(),
-                reason: format!("{e}"),
-            })?;
+        self.alpn_handlers
+            .insert(ALPN_TOLKI_WIRE_PROTOCOL_2_0_0.to_vec(), wire_handler);
+
+        // Spawn the accept loop. The handle is owned by the server; on
+        // drop it aborts so the loop exits cleanly.
+        let client = Arc::clone(self.transport.inner());
+        let handlers = Arc::clone(&self.alpn_handlers);
+        let handle = tokio::spawn(run_accept_loop(client, handlers));
+        *slot = Some(handle);
+        drop(slot);
+
         debug!(
             alpn = %String::from_utf8_lossy(ALPN_TOLKI_WIRE_PROTOCOL_2_0_0),
             max_concurrent_streams = self.config.max_concurrent_streams,
             max_concurrent_connections = self.config.max_concurrent_connections,
-            "RpcServer registered ALPN handler",
+            "RpcServer wire handler installed and accept loop spawned",
         );
         Ok(())
     }
 }
 
-/// Internal [`AlpnHandler`] that drives а connection's `accept_bi` loop
-/// and spawns а task per inbound stream, bounded by а pair of semaphores.
+impl Drop for RpcServer {
+    fn drop(&mut self) {
+        // `Mutex::get_mut` avoids а lock-acquire on drop — we have
+        // exclusive access through `&mut self`, so there cannot be
+        // а concurrent owner. Poisoning surfaces only if а prior
+        // panic damaged the mutex; `get_mut().ok()` degrades gracefully
+        // — а poisoned slot whose handle we cannot reach simply leaks
+        // the spawned task to abort itself when iroh closes the endpoint,
+        // matching the pre-refactor behaviour on drop-during-panic.
+        if let Ok(slot) = self.accept_loop.get_mut()
+            && let Some(handle) = slot.take()
+        {
+            // Aborting is sufficient — the spawned loop holds an
+            // `Arc<Client>` clone, не the lone owner, so socket teardown
+            // is the caller's responsibility (via `Client::shutdown`).
+            handle.abort();
+        }
+    }
+}
+
+/// Drain the iroh endpoint's accept stream, dispatching each inbound
+/// connection by negotiated ALPN.
 ///
-/// Stored в an `Arc` inside nerw-core's handler registry; cloned per
-/// inbound connection. The trait method `handle` is sync — we spawn the
-/// async work onto the ambient tokio runtime.
+/// `handlers` is shared с [`RpcServer`] — registrations land в the
+/// same `DashMap`. Lookup is scoped (we don't hold the entry across
+/// `.await` on the handler call) so concurrent `register_alpn_handler`
+/// calls during accept are safe.
+async fn run_accept_loop(
+    client: Arc<nerw_core::client::Client>,
+    handlers: Arc<DashMap<Vec<u8>, Arc<dyn AlpnHandler>>>,
+) {
+    loop {
+        let Some(incoming) = client.accept().await else {
+            debug!("RpcServer accept loop: endpoint closed");
+            return;
+        };
+        let handlers = Arc::clone(&handlers);
+        // Fire-and-forget per-connection task — а slow handler cannot
+        // starve subsequent inbound arrivals.
+        tokio::spawn(async move {
+            let mut accepting = match incoming.accept() {
+                Ok(a) => a,
+                Err(e) => {
+                    debug!(error = %e, "incoming.accept() failed");
+                    return;
+                }
+            };
+            let alpn = match accepting.alpn().await {
+                Ok(a) => a,
+                Err(e) => {
+                    debug!(error = %e, "accepting.alpn() failed");
+                    return;
+                }
+            };
+            let conn = match accepting.await {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!(error = %e, "incoming connection failed handshake");
+                    return;
+                }
+            };
+
+            // Lookup, clone the Arc, drop the DashMap guard BEFORE
+            // running the handler.
+            let handler = handlers.get(&alpn).map(|entry| Arc::clone(&entry));
+            if let Some(h) = handler {
+                if let Err(e) = h.handle(conn).await {
+                    debug!(
+                        alpn = %String::from_utf8_lossy(&alpn),
+                        error = %e,
+                        "ALPN handler returned an error",
+                    );
+                }
+            } else {
+                debug!(
+                    alpn = %String::from_utf8_lossy(&alpn),
+                    "no nerw-rpc handler registered for ALPN — closing connection",
+                );
+                conn.close(CLOSE_NO_HANDLER.into(), b"no-handler-registered");
+            }
+        });
+    }
+}
+
+/// Internal [`AlpnHandler`] for the `tolki/wire-protocol/2.0.0` ALPN.
+///
+/// Drives а connection's `accept_bi` loop и spawns а task per inbound
+/// stream, bounded by а pair of semaphores. Stored в the
+/// `alpn_handlers` `DashMap` inside [`RpcServer`]; cloned per inbound
+/// connection.
 struct WireDispatchHandler {
     /// Shared handler lookup table populated by application code.
     registry: Arc<MethodRegistry>,
@@ -223,43 +447,40 @@ struct WireDispatchHandler {
     /// semaphore wait briefly before processing rather than being dropped.
     stream_permits: Arc<Semaphore>,
     /// Caps concurrent connection-loop tasks. Each accepted connection
-    /// (one `WireDispatchHandler::handle` call) acquires а permit before
-    /// spawning the long-lived accept-bi loop.
+    /// acquires а permit before spawning the long-lived accept-bi loop.
     connection_permits: Arc<Semaphore>,
-    /// Monotonic counter for synthesising stable connection-ids when
+    /// Monotonic counter for synthesising stable connection-ids когда
     /// iroh's own `Connection::stable_id()` is not deterministic across
-    /// reconnects (it is local-process scoped which is fine for our use).
+    /// reconnects (it is local-process scoped, which is fine для our use).
     connection_id_counter: Arc<AtomicU64>,
 }
 
+#[async_trait]
 impl AlpnHandler for WireDispatchHandler {
-    fn handle(&self, connection: Connection) {
+    async fn handle(&self, connection: Connection) -> RpcResult<()> {
         let registry = Arc::clone(&self.registry);
         let stream_permits = Arc::clone(&self.stream_permits);
-        let connection_permits = Arc::clone(&self.connection_permits);
-        let connection_id_counter = Arc::clone(&self.connection_id_counter);
-        let connection_id = connection_id_counter.fetch_add(1, Ordering::Relaxed);
-        tokio::spawn(async move {
-            // Connection cap defends against accidental fan-out — а
-            // buggy peer reopening connections in а tight loop will
-            // queue up here rather than spawning unbounded tasks. Not
-            // а Byzantine-attacker defence — those should be filtered
-            // upstream by nerw-core peer auth.
-            let permit = match connection_permits.acquire_owned().await {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(error = %e, "connection semaphore closed unexpectedly");
-                    return;
-                }
-            };
-            run_connection_loop(connection, registry, stream_permits, connection_id).await;
-            drop(permit);
-        });
+        let connection_id = self.connection_id_counter.fetch_add(1, Ordering::Relaxed);
+        // Connection cap defends against accidental fan-out — а buggy
+        // peer reopening connections в а tight loop will queue up here
+        // rather than spawning unbounded tasks. Not а Byzantine-attacker
+        // defence — those should be filtered upstream by nerw-core peer
+        // auth.
+        let permit = match Arc::clone(&self.connection_permits).acquire_owned().await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "connection semaphore closed unexpectedly");
+                return Ok(());
+            }
+        };
+        run_connection_loop(connection, registry, stream_permits, connection_id).await;
+        drop(permit);
+        Ok(())
     }
 }
 
 /// Per-connection accept-bi loop. Fires а fresh handler task per stream
-/// so concurrent requests on the same connection do not serialise.
+/// так concurrent requests on the same connection do not serialise.
 ///
 /// Each spawned per-stream task acquires а permit from `stream_permits`
 /// before processing — bounding total in-flight stream work.
@@ -319,7 +540,7 @@ async fn handle_unary_stream(
     let accept_instant = std::time::Instant::now();
     let stream_id_u64 = u64::from(send.id());
     // read_to_end returns Vec<u8>; freeze к Bytes once и slice through
-    // the dispatch path so handlers receive а ref-counted view с no
+    // the dispatch path так handlers receive а ref-counted view с no
     // further copying.
     let buf: Bytes = match recv.read_to_end(RPC_STREAM_READ_LIMIT).await {
         Ok(v) => Bytes::from(v),
@@ -356,8 +577,8 @@ async fn handle_unary_stream(
 /// Decode the request frame, look up the handler, invoke it, and
 /// return its bytes (or an [`RpcError`]).
 ///
-/// The full-frame `buf` is owned here so we can slice the postcard
-/// payload as а zero-copy [`Bytes`] view that's handed to the handler.
+/// The full-frame `buf` is owned here так we can slice the postcard
+/// payload as а zero-copy [`Bytes`] view that's handed к the handler.
 async fn dispatch_unary(
     buf: Bytes,
     connection: Connection,

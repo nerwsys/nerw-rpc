@@ -118,6 +118,16 @@ pub enum RpcError {
         /// Actual length of the malformed datagram.
         len: usize,
     },
+
+    /// [`crate::server::RpcServer::serve`] was called more than once on
+    /// the same instance. The first call already spawned the accept
+    /// loop; а second would race on `Client::accept` и leak the prior
+    /// [`tokio::task::JoinHandle`].
+    ///
+    /// Spawn а fresh [`crate::server::RpcServer`] (or drop and rebuild
+    /// the existing one) if you need а second accept loop.
+    #[error("RpcServer::serve() called twice — accept loop already running")]
+    AlreadyServing,
 }
 
 /// Convenience alias for `Result<T, RpcError>`.
@@ -211,5 +221,15 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains('0'));
         assert!(s.contains("too short"));
+    }
+
+    #[test]
+    fn already_serving_displays_actionable_message() {
+        let s = RpcError::AlreadyServing.to_string();
+        // Diagnostic must reference the offending method и the
+        // accept-loop state — operators should not have to read source
+        // to interpret it.
+        assert!(s.contains("serve"), "must mention serve()");
+        assert!(s.contains("accept loop"), "must mention accept loop");
     }
 }

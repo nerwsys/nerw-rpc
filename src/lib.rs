@@ -15,13 +15,19 @@
 //!
 //! ## Status
 //!
-//! Phase 1 — core types, codec, method registry. Transport binding
-//! (iroh integration) coming in Phase 2 после nerw Batch 2d merges.
+//! Phase 2.1 — internal refactor onto post-R3 nerw-core surface
+//! (commit `48ec369`). Public API of nerw-rpc preserved
+//! ([`RpcServer::serve`], [`RpcClient::call`],
+//! [`DatagramDispatcher::register`] / [`DatagramDispatcher::unregister`] /
+//! [`DatagramDispatcher::dispatch`]). Phase 2 wire-format intelligence
+//! (ALPN dispatch table, accept loop, per-connection datagram readers)
+//! now lives entirely inside nerw-rpc — nerw-core has been pared down к
+//! pure iroh transport primitives.
 //!
 //! См. authoritative design в
 //! `/src/tasks/tolki-server/.artifacts/research/NERW-RPC-DESIGN.md`.
 
-#![doc(html_root_url = "https://docs.rs/nerw-rpc/0.3.0")]
+#![doc(html_root_url = "https://docs.rs/nerw-rpc/0.4.0")]
 #![cfg_attr(
     test,
     allow(
@@ -66,14 +72,14 @@ pub use crate::context::{
     AuthenticatedContext, NodeId, PeerMetadata, RpcContext, SessionInfo, TimingInfo, TracingInfo,
     loopback_node_id,
 };
-pub use crate::datagram::{DatagramDispatcher, DatagramHandler};
+pub use crate::datagram::{DEFAULT_MAX_CONCURRENT_DATAGRAMS, DatagramDispatcher, DatagramHandler};
 pub use crate::error::{RpcError, RpcResult};
 pub use crate::method::{MethodHandler, MethodName, MethodRegistry};
 pub use crate::server::{
     DEFAULT_MAX_CONCURRENT_CONNECTIONS, DEFAULT_MAX_CONCURRENT_STREAMS, RpcServer, RpcServerConfig,
 };
 pub use crate::transport::{
-    ALPN_NERW_RPC_2_0_0, ALPN_TOLKI_DATAGRAM_2_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0,
+    ALPN_NERW_RPC_2_0_0, ALPN_TOLKI_DATAGRAM_2_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, AlpnHandler,
     IrohTransportClient, NERW_RPC_ALPNS,
 };
 pub use crate::wire_error::WireError;
