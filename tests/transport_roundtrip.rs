@@ -878,8 +878,7 @@ async fn max_concurrent_streams_enforced() -> Result<()> {
         max_concurrent_streams: 2,
         max_concurrent_connections: 1024,
     };
-    let server =
-        RpcServer::with_config(fix.bravo_transport.clone(), Arc::clone(&registry), cfg);
+    let server = RpcServer::with_config(fix.bravo_transport.clone(), Arc::clone(&registry), cfg);
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -1140,10 +1139,7 @@ async fn serve_twice_errors_with_already_serving() -> Result<()> {
     server.serve().await.context("first serve")?;
 
     // Second call on the SAME instance MUST surface AlreadyServing.
-    let err = server
-        .serve()
-        .await
-        .expect_err("second serve() must error");
+    let err = server.serve().await.expect_err("second serve() must error");
     match err {
         RpcError::AlreadyServing => {}
         other => panic!("expected RpcError::AlreadyServing, got {other:?}"),

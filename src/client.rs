@@ -105,12 +105,7 @@ impl RpcClient {
     ///   body failed (server-side bug).
     /// - [`RpcError::Handler`]                — server returned а handler error.
     /// - [`RpcError::UnknownMethod`]          — server-side registry miss.
-    pub async fn call(
-        &self,
-        peer: &NodeId,
-        method_name: &str,
-        request: Bytes,
-    ) -> RpcResult<Bytes> {
+    pub async fn call(&self, peer: &NodeId, method_name: &str, request: Bytes) -> RpcResult<Bytes> {
         let result = self.call_inner(peer, method_name, request).await;
         if let Err(ref err) = result {
             // N2: evict the cached connection on transport-layer failure
