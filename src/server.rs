@@ -49,6 +49,7 @@
 //! не link the daemon crate.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
@@ -96,6 +97,16 @@ pub const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 256;
 /// in iroh's table — peers blocked on the semaphore wait briefly,
 /// preserving correctness while bounding resource usage.
 pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
+
+/// QUIC application-layer close code: peer attempted а connection on
+/// an ALPN with no registered handler. The inbound side closes the
+/// connection immediately so the peer learns the protocol is unbound
+/// rather than hanging on а silently-discarded handshake.
+///
+/// Surfaced as а named constant so future close-code allocations are
+/// visible в one place, and accidental collisions across call sites
+/// fail at compile time.
+const CLOSE_NO_HANDLER: u32 = 1;
 
 /// Tunable knobs for [`RpcServer`].
 ///
@@ -151,19 +162,39 @@ pub struct RpcServer {
     /// [`Self::serve`] installs the built-in wire-protocol handler;
     /// callers can add more via [`Self::register_alpn_handler`].
     alpn_handlers: Arc<DashMap<Vec<u8>, Arc<dyn AlpnHandler>>>,
-    /// Handle к the spawned accept loop task. `None` before
-    /// [`Self::serve`] runs; `Some` afterwards. Aborted on `Drop` so
-    /// the loop exits cleanly с the server.
-    accept_loop: Option<JoinHandle<()>>,
+    /// Handle к the spawned accept loop task, wrapped в а sync mutex
+    /// so [`Self::serve`] takes `&self` (not `&mut self`) и preserves
+    /// the Phase 2 public API. `None` before [`Self::serve`] runs;
+    /// `Some` afterwards. Aborted on `Drop` so the loop exits cleanly
+    /// с the server.
+    ///
+    /// **Mutex choice rationale:** [`std::sync::Mutex`] (not
+    /// [`once_cell::sync::OnceCell`]) — `serve()` returns
+    /// [`RpcError::AlreadyServing`] on the second call rather than
+    /// panicking, so the slot is logically «check-and-fill» с а typed
+    /// failure path. The mutex is locked exactly twice over the server's
+    /// lifetime (once в [`Self::serve`], once в [`Drop`]); contention
+    /// is statically impossible — no two threads ever race on it.
+    accept_loop: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for RpcServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `accept_loop` is а sync mutex; lock briefly to read the slot.
+        // А poisoned guard still yields `Some`/`None` correctly — we
+        // use `.lock().ok()` so Debug never panics on poisoning, which
+        // would mask the real failure being formatted.
+        let running = self
+            .accept_loop
+            .lock()
+            .ok()
+            .as_deref()
+            .is_some_and(Option::is_some);
         f.debug_struct("RpcServer")
             .field("transport", &self.transport)
             .field("config", &self.config)
             .field("registered_alpns", &self.alpn_handlers.len())
-            .field("accept_loop_running", &self.accept_loop.is_some())
+            .field("accept_loop_running", &running)
             .finish_non_exhaustive()
     }
 }
@@ -194,7 +225,7 @@ impl RpcServer {
             registry,
             config,
             alpn_handlers: Arc::new(DashMap::new()),
-            accept_loop: None,
+            accept_loop: Mutex::new(None),
         }
     }
 
@@ -241,10 +272,12 @@ impl RpcServer {
 
     /// Install the wire-protocol handler и spawn the accept loop.
     ///
-    /// Idempotent в the trivial sense — calling twice replaces the
-    /// previous wire handler с а fresh one bound к the same registry
-    /// и spawns а second accept loop. Production callers must call
-    /// this exactly once after wiring up the server.
+    /// Takes `&self` so callers can keep the server behind an `Arc` —
+    /// the accept-loop [`JoinHandle`] lives behind an internal
+    /// [`std::sync::Mutex`]. Calling [`Self::serve`] а second time on
+    /// the same instance returns [`RpcError::AlreadyServing`] rather
+    /// than spawning а duplicate loop (two loops would race on
+    /// `Client::accept` и leak the prior handle).
     ///
     /// The ALPN [`ALPN_TOLKI_WIRE_PROTOCOL_2_0_0`] MUST have been declared
     /// в [`nerw_core::client::ClientConfigBuilder::with_alpn`] before
@@ -255,18 +288,39 @@ impl RpcServer {
     ///
     /// # Errors
     ///
-    /// Currently infallible — the method signature retains
-    /// `RpcResult<()>` so future variants (e.g. binding to multiple
-    /// endpoints, validating that ALPNs are pre-declared) can surface
-    /// errors без а wire-breaking change.
+    /// - [`RpcError::AlreadyServing`] — [`Self::serve`] has already
+    ///   spawned an accept loop on this instance. Spawning а second
+    ///   loop would leak the prior `JoinHandle` and race on
+    ///   `Client::accept`.
     ///
-    /// The method remains `async` for the same reason — Phase 2's
-    /// implementation awaited `register_alpn_handler` (now gone). The
-    /// async signature is preserved so consumers calling `.serve().await`
-    /// continue compiling без а wire-breaking change. Clippy's
-    /// `unused_async` lint is suppressed at the call site.
+    /// The method remains `async` so future variants (e.g. binding to
+    /// multiple endpoints, validating that ALPNs are pre-declared) can
+    /// surface errors без а wire-breaking change. Phase 2's
+    /// implementation awaited `register_alpn_handler` (now gone); the
+    /// async signature is preserved so consumers calling
+    /// `.serve().await` continue compiling без а wire-breaking change.
+    /// Clippy's `unused_async` lint is suppressed at the call site.
     #[allow(clippy::unused_async)]
-    pub async fn serve(&mut self) -> RpcResult<()> {
+    pub async fn serve(&self) -> RpcResult<()> {
+        // Reserve the accept-loop slot BEFORE installing the wire
+        // handler so а second `serve()` call cannot leave the handler
+        // table partially mutated. The mutex is locked briefly only
+        // for the check-and-fill; no .await happens while holding it.
+        //
+        // Mutex poisoning surfaces as а panic here only if а prior
+        // panic was caught mid-mutation — а separate bug deserving its
+        // own crash report. We propagate via `expect` rather than
+        // returning а typed error: there is no recoverable action а
+        // caller can take, и the poisoning itself is the diagnostic.
+        #[allow(clippy::expect_used)] // Poisoning = unrecoverable bug; see above.
+        let mut slot = self
+            .accept_loop
+            .lock()
+            .expect("RpcServer accept_loop mutex poisoned");
+        if slot.is_some() {
+            return Err(RpcError::AlreadyServing);
+        }
+
         // Install the built-in wire-protocol handler.
         let wire_handler: Arc<dyn AlpnHandler> = Arc::new(WireDispatchHandler {
             registry: Arc::clone(&self.registry),
@@ -282,7 +336,8 @@ impl RpcServer {
         let client = Arc::clone(self.transport.inner());
         let handlers = Arc::clone(&self.alpn_handlers);
         let handle = tokio::spawn(run_accept_loop(client, handlers));
-        self.accept_loop = Some(handle);
+        *slot = Some(handle);
+        drop(slot);
 
         debug!(
             alpn = %String::from_utf8_lossy(ALPN_TOLKI_WIRE_PROTOCOL_2_0_0),
@@ -296,7 +351,16 @@ impl RpcServer {
 
 impl Drop for RpcServer {
     fn drop(&mut self) {
-        if let Some(handle) = self.accept_loop.take() {
+        // `Mutex::get_mut` avoids а lock-acquire on drop — we have
+        // exclusive access through `&mut self`, so there cannot be
+        // а concurrent owner. Poisoning surfaces only if а prior
+        // panic damaged the mutex; `get_mut().ok()` degrades gracefully
+        // — а poisoned slot whose handle we cannot reach simply leaks
+        // the spawned task to abort itself when iroh closes the endpoint,
+        // matching the pre-refactor behaviour on drop-during-panic.
+        if let Ok(slot) = self.accept_loop.get_mut()
+            && let Some(handle) = slot.take()
+        {
             // Aborting is sufficient — the spawned loop holds an
             // `Arc<Client>` clone, не the lone owner, so socket teardown
             // is the caller's responsibility (via `Client::shutdown`).
@@ -363,7 +427,7 @@ async fn run_accept_loop(
                     alpn = %String::from_utf8_lossy(&alpn),
                     "no nerw-rpc handler registered for ALPN — closing connection",
                 );
-                conn.close(1u32.into(), b"no-handler-registered");
+                conn.close(CLOSE_NO_HANDLER.into(), b"no-handler-registered");
             }
         });
     }

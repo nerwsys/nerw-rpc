@@ -192,7 +192,7 @@ async fn unary_rpc_roundtrip() -> Result<()> {
     let mut registry = MethodRegistry::new();
     registry.register("test:hello@1.0.0/test/echo", Arc::new(EchoMethodHandler));
     let registry = Arc::new(registry);
-    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     // Client side.
@@ -233,7 +233,7 @@ async fn version_omitted_resolves_to_latest() -> Result<()> {
         Arc::new(TagHandler { tag: "v2" }),
     );
     let registry = Arc::new(registry);
-    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -279,7 +279,7 @@ async fn unknown_method_returns_typed_error() -> Result<()> {
     let mut registry = MethodRegistry::new();
     registry.register("test:hello@1.0.0/test/echo", Arc::new(EchoMethodHandler));
     let registry = Arc::new(registry);
-    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -363,7 +363,7 @@ async fn datagram_dispatch_roundtrip() -> Result<()> {
     // custom AlpnHandler для the datagram ALPN that wires inbound
     // connections к the dispatcher's per-connection read loop.
     let registry = Arc::new(MethodRegistry::new());
-    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     let datagram_alpn_handler: Arc<dyn AlpnHandler> = Arc::new(DatagramAlpnHandler {
         dispatcher: Arc::clone(&dispatcher),
     });
@@ -442,7 +442,7 @@ async fn datagram_handshake_correlation_roundtrip() -> Result<()> {
         .expect("register");
 
     let registry = Arc::new(MethodRegistry::new());
-    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     let datagram_alpn_handler: Arc<dyn AlpnHandler> = Arc::new(DatagramAlpnHandler {
         dispatcher: Arc::clone(&dispatcher),
     });
@@ -574,7 +574,7 @@ async fn concurrent_calls_do_not_serialize() -> Result<()> {
         }),
     );
     let registry = Arc::new(registry);
-    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -628,7 +628,7 @@ async fn mid_rpc_connection_drop_surfaces_transport_error() -> Result<()> {
         }),
     );
     let registry = Arc::new(registry);
-    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -681,7 +681,7 @@ async fn malformed_inbound_does_not_crash_server() -> Result<()> {
     let mut registry = MethodRegistry::new();
     registry.register("test:hello@1.0.0/test/echo", Arc::new(EchoMethodHandler));
     let registry = Arc::new(registry);
-    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let bravo_id = fix.bravo_transport.node_id();
@@ -761,7 +761,7 @@ async fn handler_returns_error_propagates() -> Result<()> {
     let mut registry = MethodRegistry::new();
     registry.register("test:hello@1.0.0/test/fail", Arc::new(ErroringHandler));
     let registry = Arc::new(registry);
-    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -800,7 +800,7 @@ async fn large_payload_1mb_roundtrip() -> Result<()> {
     let mut registry = MethodRegistry::new();
     registry.register("test:hello@1.0.0/test/echo", Arc::new(EchoMethodHandler));
     let registry = Arc::new(registry);
-    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -871,7 +871,7 @@ async fn max_concurrent_streams_enforced() -> Result<()> {
         max_concurrent_streams: 2,
         max_concurrent_connections: 1024,
     };
-    let mut server =
+    let server =
         RpcServer::with_config(fix.bravo_transport.clone(), Arc::clone(&registry), cfg);
     server.serve().await.context("server.serve")?;
 
@@ -972,7 +972,7 @@ async fn accept_loop_dispatches_by_alpn() -> Result<()> {
     let mut registry = MethodRegistry::new();
     registry.register("test:hello@1.0.0/test/echo", Arc::new(EchoMethodHandler));
     let registry = Arc::new(registry);
-    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
 
     let datagram_invocations = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let datagram_notify = Arc::new(tokio::sync::Notify::new());
@@ -1052,7 +1052,7 @@ async fn evict_cached_connection_on_transport_error() -> Result<()> {
         }),
     );
     let registry = Arc::new(registry);
-    let mut server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
     server.serve().await.context("server.serve")?;
 
     let client = RpcClient::new(fix.alpha_transport.clone());
@@ -1115,5 +1115,31 @@ async fn evict_cached_connection_on_transport_error() -> Result<()> {
         "transport error must trigger eviction so the (peer, alpn) cache is empty",
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn serve_twice_errors_with_already_serving() -> Result<()> {
+    // Phase 2.1 N3 — `serve()` is single-shot. Calling twice would
+    // spawn а duplicate accept loop racing on `Client::accept` и leak
+    // the previous `JoinHandle`. The framework rejects the second call
+    // with а typed [`RpcError::AlreadyServing`] instead.
+    let (fix, _tmp_a, _tmp_b) = build_duo("twice-alpha", "twice-bravo").await?;
+
+    let registry = Arc::new(MethodRegistry::new());
+    let server = RpcServer::new(fix.bravo_transport.clone(), Arc::clone(&registry));
+
+    // First call MUST succeed — installs the wire handler + spawns the loop.
+    server.serve().await.context("first serve")?;
+
+    // Second call on the SAME instance MUST surface AlreadyServing.
+    let err = server
+        .serve()
+        .await
+        .expect_err("second serve() must error");
+    match err {
+        RpcError::AlreadyServing => {}
+        other => panic!("expected RpcError::AlreadyServing, got {other:?}"),
+    }
     Ok(())
 }

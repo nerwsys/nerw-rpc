@@ -1937,6 +1937,7 @@ dependencies = [
  "libc",
  "rustls",
  "rustls-pki-types",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

@@ -134,11 +134,13 @@ impl WireError {
             RpcError::Codec(e) => Self::Codec {
                 display: e.to_string(),
             },
-            // Anything else (Handler, transport errors, datagram errors)
-            // collapses к а handler-error envelope с the Display string.
-            // Transport errors на server side never cross the wire in
-            // practice — а write_all failure prevents writing the error
-            // frame at all — but we keep the mapping total для exhaustiveness.
+            // Anything else (Handler, transport errors, datagram errors,
+            // server-lifecycle errors) collapses к а handler-error envelope
+            // с the Display string. Transport / lifecycle errors on the
+            // server side never cross the wire in practice — а write_all
+            // failure prevents writing the error frame at all, и
+            // `AlreadyServing` is surfaced before any connection is
+            // accepted — but we keep the mapping total для exhaustiveness.
             other @ (RpcError::Handler(_)
             | RpcError::TransportOpenSubstream { .. }
             | RpcError::TransportRegisterAlpn { .. }
@@ -146,7 +148,8 @@ impl WireError {
             | RpcError::TransportWrite { .. }
             | RpcError::DatagramStreamIdCollision { .. }
             | RpcError::DatagramStreamIdUnknown { .. }
-            | RpcError::DatagramTooShort { .. }) => Self::HandlerError {
+            | RpcError::DatagramTooShort { .. }
+            | RpcError::AlreadyServing) => Self::HandlerError {
                 display: other.to_string(),
             },
         }
