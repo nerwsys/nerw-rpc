@@ -53,8 +53,14 @@
 //! - `nerw/mesh/1.0.0`          — mesh control plane (peer discovery,
 //!   gossip, daemon coordination). Owned by nerw-daemon's wire layer,
 //!   NOT the nerw-rpc framework. Listed here для convenience aggregate
-//!   so callers building а single shared endpoint can declare all three
+//!   so callers building а single shared endpoint can declare all four
 //!   ALPNs in one shot.
+//! - `nerw/transit/1.0.0`       — peer-as-relay transit (NRW-000045).
+//!   Phase A1 ships the constant + the frame codec
+//!   ([`crate::transit`] module); server / client wiring lands in
+//!   Phase A2-A3. Single role-discriminated ALPN (vs libp2p's split
+//!   HOP/STOP) — see
+//!   `/src/nerw/nerw-infra/CIRCUIT-RELAY-V2-ARCHITECTURE.md`.
 
 use std::sync::Arc;
 
@@ -110,6 +116,26 @@ pub const ALPN_NERW_DATAGRAM_1_0_0: &[u8] = b"nerw/datagram/1.0.0";
 /// nerw-daemon will ever accept в one shot.
 pub const ALPN_NERW_MESH_1_0_0: &[u8] = b"nerw/mesh/1.0.0";
 
+/// Peer-as-relay (transit) ALPN — decentralized circuit relay for NAT
+/// traversal (NRW-000045 Phase A).
+///
+/// Carries both HOP-style (client→relay: "reserve a slot" / "open a
+/// circuit") и STOP-style (relay→target: "incoming circuit") semantics
+/// над a single ALPN, differentiated by the first frame's variant.
+/// libp2p's Circuit Relay v2 splits HOP/STOP across two ALPNs; iroh's
+/// per-stream multiplex permits the simpler role-discriminated single-ALPN
+/// design — see
+/// `/src/nerw/nerw-infra/CIRCUIT-RELAY-V2-ARCHITECTURE.md` Section
+/// "Что упрощаем благодаря iroh".
+///
+/// Wire format (postcard-encoded frames) is defined in [`crate::transit`].
+///
+/// nerw-rpc declares the constant so callers building a single shared
+/// endpoint can advertise every ALPN nerw-rpc будет ever accept in one
+/// shot. Phase A1 ships только the constant + frame codec; the
+/// server-side handler (Phase A2) + client API (Phase A3) are pending.
+pub const ALPN_NERW_TRANSIT_1_0_0: &[u8] = b"nerw/transit/1.0.0";
+
 /// Aggregate convenience for [`nerw_core::client::ClientConfigBuilder::with_alpn`].
 ///
 /// Callers iterate this slice к declare every ALPN nerw-rpc + nerw-core
@@ -128,6 +154,7 @@ pub const NERW_RPC_ALPNS: &[&[u8]] = &[
     ALPN_NERW_WIRE_PROTOCOL_1_0_0,
     ALPN_NERW_DATAGRAM_1_0_0,
     ALPN_NERW_MESH_1_0_0,
+    ALPN_NERW_TRANSIT_1_0_0,
 ];
 
 /// Handler trait for inbound connections that negotiated а custom ALPN.
@@ -235,7 +262,8 @@ mod tests {
         assert!(NERW_RPC_ALPNS.contains(&ALPN_NERW_WIRE_PROTOCOL_1_0_0));
         assert!(NERW_RPC_ALPNS.contains(&ALPN_NERW_DATAGRAM_1_0_0));
         assert!(NERW_RPC_ALPNS.contains(&ALPN_NERW_MESH_1_0_0));
-        assert_eq!(NERW_RPC_ALPNS.len(), 3);
+        assert!(NERW_RPC_ALPNS.contains(&ALPN_NERW_TRANSIT_1_0_0));
+        assert_eq!(NERW_RPC_ALPNS.len(), 4);
     }
 
     #[test]
@@ -243,5 +271,6 @@ mod tests {
         assert_eq!(ALPN_NERW_WIRE_PROTOCOL_1_0_0, b"nerw/wire-protocol/1.0.0");
         assert_eq!(ALPN_NERW_DATAGRAM_1_0_0, b"nerw/datagram/1.0.0");
         assert_eq!(ALPN_NERW_MESH_1_0_0, b"nerw/mesh/1.0.0");
+        assert_eq!(ALPN_NERW_TRANSIT_1_0_0, b"nerw/transit/1.0.0");
     }
 }
