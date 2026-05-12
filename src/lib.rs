@@ -27,7 +27,7 @@
 //! См. authoritative design в
 //! `/src/tasks/tolki-server/.artifacts/research/NERW-RPC-DESIGN.md`.
 
-#![doc(html_root_url = "https://docs.rs/nerw-rpc/0.4.0")]
+#![doc(html_root_url = "https://docs.rs/nerw-rpc/0.6.0")]
 #![cfg_attr(
     test,
     allow(
@@ -62,6 +62,7 @@ pub mod datagram;
 pub mod error;
 pub mod method;
 pub mod server;
+pub mod transit;
 pub mod transport;
 pub mod wire;
 pub mod wire_error;
@@ -78,8 +79,12 @@ pub use crate::method::{MethodHandler, MethodName, MethodRegistry};
 pub use crate::server::{
     DEFAULT_MAX_CONCURRENT_CONNECTIONS, DEFAULT_MAX_CONCURRENT_STREAMS, RpcServer, RpcServerConfig,
 };
+pub use crate::transit::{
+    Capabilities, ConnectOutcome, DEFAULT_RESERVATION_TTL_SECS, Limits, ReserveOutcome,
+    TransitError, TransitFrame, Voucher, decode_frame, encode_frame,
+};
 pub use crate::transport::{
-    ALPN_NERW_DATAGRAM_1_0_0, ALPN_NERW_MESH_1_0_0, ALPN_NERW_WIRE_PROTOCOL_1_0_0, AlpnHandler,
-    IrohTransportClient, NERW_RPC_ALPNS,
+    ALPN_NERW_DATAGRAM_1_0_0, ALPN_NERW_MESH_1_0_0, ALPN_NERW_TRANSIT_1_0_0,
+    ALPN_NERW_WIRE_PROTOCOL_1_0_0, AlpnHandler, IrohTransportClient, NERW_RPC_ALPNS,
 };
 pub use crate::wire_error::WireError;
