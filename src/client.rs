@@ -35,7 +35,7 @@ use tracing::trace;
 
 use crate::error::{RpcError, RpcResult};
 use crate::server::build_unary_request_frame;
-use crate::transport::{ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, IrohTransportClient};
+use crate::transport::{ALPN_NERW_WIRE_PROTOCOL_1_0_0, IrohTransportClient};
 use crate::wire::{OPCODE_UNARY_ERROR, OPCODE_UNARY_RESPONSE};
 use crate::wire_error::WireError;
 
@@ -50,7 +50,7 @@ const RPC_RESPONSE_READ_LIMIT: usize = 8 * 1024 * 1024;
 ///
 /// Wraps а shared [`IrohTransportClient`] handle. Issuing а call opens
 /// (or reuses, via nerw-core's connection cache) а QUIC connection
-/// negotiated с [`ALPN_TOLKI_WIRE_PROTOCOL_2_0_0`], opens а fresh bidi
+/// negotiated с [`ALPN_NERW_WIRE_PROTOCOL_1_0_0`], opens а fresh bidi
 /// substream, writes the framed request, и reads the response.
 ///
 /// Cloning [`RpcClient`] is cheap — both fields wrap `Arc`s under the
@@ -92,7 +92,7 @@ impl RpcClient {
     /// generated stub) on success, or а typed [`RpcError`] on failure.
     ///
     /// On transport read/write errors the cached connection for
-    /// `(peer, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0)` is evicted so the next
+    /// `(peer, ALPN_NERW_WIRE_PROTOCOL_1_0_0)` is evicted so the next
     /// call re-handshakes (N2 stale-conn defence — see module docs).
     ///
     /// # Errors
@@ -120,7 +120,7 @@ impl RpcClient {
             if is_transport_io_error(err) {
                 self.transport
                     .inner()
-                    .evict_cached_connection(peer, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0)
+                    .evict_cached_connection(peer, ALPN_NERW_WIRE_PROTOCOL_1_0_0)
                     .await;
                 trace!(
                     peer = %peer,
@@ -144,7 +144,7 @@ impl RpcClient {
         let (mut send, mut recv) = self
             .transport
             .inner()
-            .open_substream(peer, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0)
+            .open_substream(peer, ALPN_NERW_WIRE_PROTOCOL_1_0_0)
             .await
             .map_err(|e| RpcError::TransportOpenSubstream {
                 node_id: format!("{peer}"),

@@ -63,7 +63,7 @@ use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, SecretKey, TransportAddr};
 use nerw_core::client::{Client, ClientConfig};
 use nerw_rpc::{
-    ALPN_NERW_RPC_2_0_0, ALPN_TOLKI_DATAGRAM_2_0_0, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, AlpnHandler,
+    ALPN_NERW_DATAGRAM_1_0_0, ALPN_NERW_MESH_1_0_0, ALPN_NERW_WIRE_PROTOCOL_1_0_0, AlpnHandler,
     DatagramDispatcher, DatagramHandler, IrohTransportClient, MethodHandler, MethodRegistry,
     RpcClient, RpcContext, RpcError, RpcResult, RpcServer, RpcServerConfig, wire::encode_stream_id,
 };
@@ -87,7 +87,7 @@ fn write_self_signed_ca(dest: &std::path::Path) -> Result<()> {
 
 /// Build а multi-ALPN test [`ClientConfig`] suitable для loopback
 /// nerw-rpc Phase 2.1 tests. Pre-registers ALL three ALPNs the framework
-/// dispatches plus the built-in `nerw/rpc/2.0.0` so the endpoint
+/// dispatches plus the built-in `nerw/mesh/1.0.0` so the endpoint
 /// accepts every protocol nerw-rpc + nerw-core might negotiate.
 ///
 /// Identity is generated in-process via [`SecretKey::generate`] —
@@ -100,9 +100,9 @@ fn make_test_config(tmp: &TempDir, label: &str) -> Result<(ClientConfig, PathBuf
         .with_secret_key(SecretKey::generate())
         .with_ca_pem_path(&ca_pem)
         .with_relay_url("https://127.0.0.1:1/")
-        .with_alpn(ALPN_NERW_RPC_2_0_0.to_vec())
-        .with_alpn(ALPN_TOLKI_WIRE_PROTOCOL_2_0_0.to_vec())
-        .with_alpn(ALPN_TOLKI_DATAGRAM_2_0_0.to_vec())
+        .with_alpn(ALPN_NERW_MESH_1_0_0.to_vec())
+        .with_alpn(ALPN_NERW_WIRE_PROTOCOL_1_0_0.to_vec())
+        .with_alpn(ALPN_NERW_DATAGRAM_1_0_0.to_vec())
         .with_discovery(None)
         .build();
     Ok((cfg, ca_pem))
@@ -367,7 +367,7 @@ async fn datagram_dispatch_roundtrip() -> Result<()> {
     let datagram_alpn_handler: Arc<dyn AlpnHandler> = Arc::new(DatagramAlpnHandler {
         dispatcher: Arc::clone(&dispatcher),
     });
-    server.register_alpn_handler(ALPN_TOLKI_DATAGRAM_2_0_0, datagram_alpn_handler);
+    server.register_alpn_handler(ALPN_NERW_DATAGRAM_1_0_0, datagram_alpn_handler);
     server.serve().await.context("server.serve")?;
 
     // Alpha dials с the datagram ALPN — this triggers bravo's accept
@@ -376,7 +376,7 @@ async fn datagram_dispatch_roundtrip() -> Result<()> {
     let alpha_inner = Arc::clone(fix.alpha_transport.inner());
     let bravo_id = fix.bravo_transport.node_id();
     let conn = alpha_inner
-        .dial_with_alpn(&bravo_id, ALPN_TOLKI_DATAGRAM_2_0_0)
+        .dial_with_alpn(&bravo_id, ALPN_NERW_DATAGRAM_1_0_0)
         .await
         .context("dial_with_alpn")?;
 
@@ -451,13 +451,13 @@ async fn datagram_handshake_correlation_roundtrip() -> Result<()> {
     let datagram_alpn_handler: Arc<dyn AlpnHandler> = Arc::new(DatagramAlpnHandler {
         dispatcher: Arc::clone(&dispatcher),
     });
-    server.register_alpn_handler(ALPN_TOLKI_DATAGRAM_2_0_0, datagram_alpn_handler);
+    server.register_alpn_handler(ALPN_NERW_DATAGRAM_1_0_0, datagram_alpn_handler);
     server.serve().await.context("server.serve")?;
 
     let alpha_inner = Arc::clone(fix.alpha_transport.inner());
     let bravo_id = fix.bravo_transport.node_id();
     let conn = alpha_inner
-        .dial_with_alpn(&bravo_id, ALPN_TOLKI_DATAGRAM_2_0_0)
+        .dial_with_alpn(&bravo_id, ALPN_NERW_DATAGRAM_1_0_0)
         .await
         .context("dial_with_alpn")?;
 
@@ -698,7 +698,7 @@ async fn malformed_inbound_does_not_crash_server() -> Result<()> {
     // because it auto-frames с OPCODE_UNARY_REQUEST.
     let alpha_inner = Arc::clone(fix.alpha_transport.inner());
     let (mut send, mut recv) = alpha_inner
-        .open_substream(&bravo_id, ALPN_TOLKI_WIRE_PROTOCOL_2_0_0)
+        .open_substream(&bravo_id, ALPN_NERW_WIRE_PROTOCOL_1_0_0)
         .await
         .context("open_substream")?;
 
@@ -986,7 +986,7 @@ async fn accept_loop_dispatches_by_alpn() -> Result<()> {
         invocations: Arc::clone(&datagram_invocations),
         notify: Arc::clone(&datagram_notify),
     });
-    server.register_alpn_handler(ALPN_TOLKI_DATAGRAM_2_0_0, datagram_handler);
+    server.register_alpn_handler(ALPN_NERW_DATAGRAM_1_0_0, datagram_handler);
     server.serve().await.context("server.serve")?;
 
     // After serve(), the built-in wire handler + our custom datagram
@@ -1018,7 +1018,7 @@ async fn accept_loop_dispatches_by_alpn() -> Result<()> {
     // handler, NOT the wire handler. Verify by counter.
     let alpha_inner = Arc::clone(fix.alpha_transport.inner());
     let _conn = alpha_inner
-        .dial_with_alpn(&bravo_id, ALPN_TOLKI_DATAGRAM_2_0_0)
+        .dial_with_alpn(&bravo_id, ALPN_NERW_DATAGRAM_1_0_0)
         .await
         .context("dial datagram ALPN")?;
 

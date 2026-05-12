@@ -181,11 +181,11 @@ mod tests {
     #[test]
     fn transport_register_alpn_displays_alpn() {
         let err = RpcError::TransportRegisterAlpn {
-            alpn: "tolki/wire-protocol/2.0.0".to_owned(),
+            alpn: "nerw/wire-protocol/1.0.0".to_owned(),
             reason: "not preregistered".to_owned(),
         };
         let s = err.to_string();
-        assert!(s.contains("tolki/wire-protocol/2.0.0"));
+        assert!(s.contains("nerw/wire-protocol/1.0.0"));
         assert!(s.contains("not preregistered"));
     }
 

@@ -37,23 +37,24 @@
 //!
 //! ## ALPN routing (owned by [`crate::server::RpcServer`] internally)
 //!
-//! - `tolki/wire-protocol/2.0.0` — bidi RPC streams (request/response,
+//! - `nerw/wire-protocol/1.0.0` — bidi RPC streams (request/response,
 //!   server-streaming, client-streaming, bidi). Dispatched к the
 //!   private wire-handler by [`crate::server::RpcServer::serve`]; opened
 //!   on demand by [`crate::client::RpcClient::call`] on the client side
 //!   via [`nerw_core::client::Client::dial_with_alpn`] +
 //!   [`nerw_core::client::Client::open_substream`].
-//! - `tolki/datagram/2.0.0`     — unreliable datagrams для voice и
+//! - `nerw/datagram/1.0.0`      — unreliable datagrams для voice и
 //!   other unreliable subprotocols. Each datagram carries а
 //!   `varint(stream-id)` prefix identifying the bidi handshake stream
 //!   that established the session (WebTransport-style correlation —
 //!   RFC 9221 + CONNECT-UDP / WebTransport). Consumers wire а
 //!   [`crate::datagram::DatagramDispatcher`] onto а connection via
 //!   [`crate::datagram::DatagramDispatcher::subscribe_connection`].
-//! - `nerw/rpc/2.0.0`           — built-in nerw protocol для inter-agent
-//!   mesh control (NOT user-facing). Owned by nerw-daemon's wire layer,
-//!   NOT the nerw-rpc framework. Listed here so callers building а
-//!   single shared endpoint can declare all three ALPNs in one shot.
+//! - `nerw/mesh/1.0.0`          — mesh control plane (peer discovery,
+//!   gossip, daemon coordination). Owned by nerw-daemon's wire layer,
+//!   NOT the nerw-rpc framework. Listed here для convenience aggregate
+//!   so callers building а single shared endpoint can declare all three
+//!   ALPNs in one shot.
 
 use std::sync::Arc;
 
@@ -70,12 +71,12 @@ use crate::error::RpcResult;
 /// [`crate::client::RpcClient::call`] on the client side via
 /// [`nerw_core::client::Client::dial_with_alpn`] +
 /// [`nerw_core::client::Client::open_substream`].
-pub const ALPN_TOLKI_WIRE_PROTOCOL_2_0_0: &[u8] = b"tolki/wire-protocol/2.0.0";
+pub const ALPN_NERW_WIRE_PROTOCOL_1_0_0: &[u8] = b"nerw/wire-protocol/1.0.0";
 
 /// Unreliable datagram ALPN — voice / RTP and other unreliable
 /// subprotocols.
 ///
-/// ## Wire format (2.0.0 — wire-breaking change vs 1.0.0)
+/// ## Wire format
 ///
 /// Each datagram carries а `varint(stream-id)` prefix identifying the
 /// bidi handshake stream that established the session, followed by the
@@ -84,10 +85,10 @@ pub const ALPN_TOLKI_WIRE_PROTOCOL_2_0_0: &[u8] = b"tolki/wire-protocol/2.0.0";
 /// streams sharing the same logical session are correlated by the
 /// handshake stream's QUIC stream-id.
 ///
-/// The 1.0.0 ALPN used а 1-byte token mapped к а 256-slot dispatcher,
-/// которое imposed а 256-session cap per connection и could not link
-/// datagrams к their establishing stream. 2.0.0 drops the cap и adds
-/// stream-handshake correlation в one wire-breaking change.
+/// An earlier internal cut keyed dispatch on а 1-byte token mapped к а
+/// 256-slot dispatcher, которое imposed а 256-session cap per connection
+/// и could not link datagrams к their establishing stream. The current
+/// wire format drops the cap и adds stream-handshake correlation.
 ///
 /// Datagrams ride on the same QUIC connection as bidi streams (iroh /
 /// Quinn natively multiplexes streams + datagrams within ONE QUIC
@@ -95,17 +96,19 @@ pub const ALPN_TOLKI_WIRE_PROTOCOL_2_0_0: &[u8] = b"tolki/wire-protocol/2.0.0";
 /// [`crate::datagram::DatagramDispatcher::subscribe_connection`], которое
 /// the application wires к а connection it gets from either а custom
 /// `AlpnHandler` (inbound) или а `dial_with_alpn` call (outbound).
-pub const ALPN_TOLKI_DATAGRAM_2_0_0: &[u8] = b"tolki/datagram/2.0.0";
+pub const ALPN_NERW_DATAGRAM_1_0_0: &[u8] = b"nerw/datagram/1.0.0";
 
-/// Built-in nerw mesh-control ALPN — owned by nerw-daemon's wire layer,
-/// listed here for the convenience aggregate [`NERW_RPC_ALPNS`].
+/// Mesh control plane ALPN — peer discovery, gossip, daemon coordination.
+///
+/// Owned by nerw-daemon's wire layer, NOT the nerw-rpc framework. Listed
+/// here для convenience aggregate [`NERW_RPC_ALPNS`].
 ///
 /// nerw-rpc callers MUST NOT register their own [`AlpnHandler`] for this
 /// ALPN — collisions с nerw-daemon's built-in dispatch are undefined
 /// behaviour. The constant is exposed solely so embedded clients
 /// declaring а single endpoint can advertise every ALPN nerw-rpc +
 /// nerw-daemon will ever accept в one shot.
-pub const ALPN_NERW_RPC_2_0_0: &[u8] = b"nerw/rpc/2.0.0";
+pub const ALPN_NERW_MESH_1_0_0: &[u8] = b"nerw/mesh/1.0.0";
 
 /// Aggregate convenience for [`nerw_core::client::ClientConfigBuilder::with_alpn`].
 ///
@@ -122,9 +125,9 @@ pub const ALPN_NERW_RPC_2_0_0: &[u8] = b"nerw/rpc/2.0.0";
 /// }
 /// ```
 pub const NERW_RPC_ALPNS: &[&[u8]] = &[
-    ALPN_TOLKI_WIRE_PROTOCOL_2_0_0,
-    ALPN_TOLKI_DATAGRAM_2_0_0,
-    ALPN_NERW_RPC_2_0_0,
+    ALPN_NERW_WIRE_PROTOCOL_1_0_0,
+    ALPN_NERW_DATAGRAM_1_0_0,
+    ALPN_NERW_MESH_1_0_0,
 ];
 
 /// Handler trait for inbound connections that negotiated а custom ALPN.
@@ -229,16 +232,16 @@ mod tests {
 
     #[test]
     fn nerw_rpc_alpns_covers_every_advertised_constant() {
-        assert!(NERW_RPC_ALPNS.contains(&ALPN_TOLKI_WIRE_PROTOCOL_2_0_0));
-        assert!(NERW_RPC_ALPNS.contains(&ALPN_TOLKI_DATAGRAM_2_0_0));
-        assert!(NERW_RPC_ALPNS.contains(&ALPN_NERW_RPC_2_0_0));
+        assert!(NERW_RPC_ALPNS.contains(&ALPN_NERW_WIRE_PROTOCOL_1_0_0));
+        assert!(NERW_RPC_ALPNS.contains(&ALPN_NERW_DATAGRAM_1_0_0));
+        assert!(NERW_RPC_ALPNS.contains(&ALPN_NERW_MESH_1_0_0));
         assert_eq!(NERW_RPC_ALPNS.len(), 3);
     }
 
     #[test]
     fn alpn_constants_have_expected_byte_strings() {
-        assert_eq!(ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, b"tolki/wire-protocol/2.0.0");
-        assert_eq!(ALPN_TOLKI_DATAGRAM_2_0_0, b"tolki/datagram/2.0.0");
-        assert_eq!(ALPN_NERW_RPC_2_0_0, b"nerw/rpc/2.0.0");
+        assert_eq!(ALPN_NERW_WIRE_PROTOCOL_1_0_0, b"nerw/wire-protocol/1.0.0");
+        assert_eq!(ALPN_NERW_DATAGRAM_1_0_0, b"nerw/datagram/1.0.0");
+        assert_eq!(ALPN_NERW_MESH_1_0_0, b"nerw/mesh/1.0.0");
     }
 }

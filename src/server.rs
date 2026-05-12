@@ -2,7 +2,7 @@
 //!
 //! Owns an internal ALPN dispatch table и drives nerw-core's accept
 //! loop directly. Inbound connections matching
-//! [`crate::transport::ALPN_TOLKI_WIRE_PROTOCOL_2_0_0`] are dispatched
+//! [`crate::transport::ALPN_NERW_WIRE_PROTOCOL_1_0_0`] are dispatched
 //! к the private wire-protocol handler, which decodes per-stream RPC
 //! frames against а shared [`crate::method::MethodRegistry`]. Advanced
 //! callers can additionally register their own
@@ -13,7 +13,7 @@
 //! ## Inbound flow (per stream)
 //!
 //! 1. Peer opens а bidi substream к our [`iroh::Endpoint`] negotiated с
-//!    `tolki/wire-protocol/2.0.0`.
+//!    `nerw/wire-protocol/1.0.0`.
 //! 2. The server's accept loop dispatches the connection к the internal
 //!    wire-dispatch handler via the [`AlpnHandler`] trait.
 //! 3. The handler spawns а per-connection task that pumps `accept_bi()`
@@ -64,7 +64,7 @@ use tracing::{debug, trace, warn};
 use crate::context::{PeerMetadata, RpcContext, TimingInfo, TracingInfo};
 use crate::error::{RpcError, RpcResult};
 use crate::method::MethodRegistry;
-use crate::transport::{ALPN_TOLKI_WIRE_PROTOCOL_2_0_0, AlpnHandler, IrohTransportClient};
+use crate::transport::{ALPN_NERW_WIRE_PROTOCOL_1_0_0, AlpnHandler, IrohTransportClient};
 use crate::wire::{
     OPCODE_UNARY_ERROR, OPCODE_UNARY_REQUEST, OPCODE_UNARY_RESPONSE, decode_method_name,
     encode_method_name,
@@ -279,7 +279,7 @@ impl RpcServer {
     /// than spawning а duplicate loop (two loops would race on
     /// `Client::accept` и leak the prior handle).
     ///
-    /// The ALPN [`ALPN_TOLKI_WIRE_PROTOCOL_2_0_0`] MUST have been declared
+    /// The ALPN [`ALPN_NERW_WIRE_PROTOCOL_1_0_0`] MUST have been declared
     /// в [`nerw_core::client::ClientConfigBuilder::with_alpn`] before
     /// [`nerw_core::client::Client::start`] — runtime extension is not
     /// supported (iroh locks the rustls server config's ALPN list at
@@ -329,7 +329,7 @@ impl RpcServer {
             connection_id_counter: Arc::new(AtomicU64::new(1)),
         });
         self.alpn_handlers
-            .insert(ALPN_TOLKI_WIRE_PROTOCOL_2_0_0.to_vec(), wire_handler);
+            .insert(ALPN_NERW_WIRE_PROTOCOL_1_0_0.to_vec(), wire_handler);
 
         // Spawn the accept loop. The handle is owned by the server; on
         // drop it aborts so the loop exits cleanly.
@@ -340,7 +340,7 @@ impl RpcServer {
         drop(slot);
 
         debug!(
-            alpn = %String::from_utf8_lossy(ALPN_TOLKI_WIRE_PROTOCOL_2_0_0),
+            alpn = %String::from_utf8_lossy(ALPN_NERW_WIRE_PROTOCOL_1_0_0),
             max_concurrent_streams = self.config.max_concurrent_streams,
             max_concurrent_connections = self.config.max_concurrent_connections,
             "RpcServer wire handler installed and accept loop spawned",
@@ -433,7 +433,7 @@ async fn run_accept_loop(
     }
 }
 
-/// Internal [`AlpnHandler`] for the `tolki/wire-protocol/2.0.0` ALPN.
+/// Internal [`AlpnHandler`] for the `nerw/wire-protocol/1.0.0` ALPN.
 ///
 /// Drives а connection's `accept_bi` loop и spawns а task per inbound
 /// stream, bounded by а pair of semaphores. Stored в the
@@ -665,7 +665,7 @@ fn build_inbound_context(
         node_id: connection.remote_id(),
         connection_id,
         stream_id,
-        alpn: ALPN_TOLKI_WIRE_PROTOCOL_2_0_0.to_vec(),
+        alpn: ALPN_NERW_WIRE_PROTOCOL_1_0_0.to_vec(),
         handshake_at_ms: now_ms,
         tls_cipher_suite: None,
     };

@@ -47,7 +47,7 @@
 //!
 //! ## Why stream-id (not а 1-byte token)
 //!
-//! Phase 2's first cut (ALPN `tolki/datagram/1.0.0`) keyed the
+//! Phase 2's first cut (an earlier internal datagram ALPN) keyed the
 //! dispatcher on а 1-byte token allocated by the handshake response.
 //! Two problems с that:
 //!
@@ -85,7 +85,7 @@ use tracing::{debug, trace};
 
 use crate::context::{PeerMetadata, RpcContext, TimingInfo, TracingInfo};
 use crate::error::{RpcError, RpcResult};
-use crate::transport::ALPN_TOLKI_DATAGRAM_2_0_0;
+use crate::transport::ALPN_NERW_DATAGRAM_1_0_0;
 use crate::wire::decode_stream_id;
 
 /// Default cap on concurrent per-frame dispatch tasks spawned by
@@ -321,7 +321,7 @@ impl DatagramDispatcher {
     /// of the connection's `remote_id()` — today the type aliases к
     /// `iroh::EndpointId`, post-R4 it will resolve к the
     /// `NerwNodeId` newtype wrapper automatically. The ALPN field
-    /// reflects [`ALPN_TOLKI_DATAGRAM_2_0_0`] regardless of the carrier
+    /// reflects [`ALPN_NERW_DATAGRAM_1_0_0`] regardless of the carrier
     /// connection's actual ALPN — datagrams ride multiplexed on QUIC
     /// connections и the dispatch protocol is unrelated to the
     /// bidi-stream ALPN.
@@ -331,7 +331,7 @@ impl DatagramDispatcher {
             node_id: from_peer,
             connection_id: 0,
             stream_id: 0,
-            alpn: ALPN_TOLKI_DATAGRAM_2_0_0.to_vec(),
+            alpn: ALPN_NERW_DATAGRAM_1_0_0.to_vec(),
             handshake_at_ms: 0,
             tls_cipher_suite: None,
         };
@@ -383,7 +383,7 @@ impl DatagramDispatcher {
     ///
     /// The established voice subprotocol pattern is:
     /// 1. Client opens а bidi stream к responder's wire-protocol ALPN
-    ///    ([`crate::transport::ALPN_TOLKI_WIRE_PROTOCOL_2_0_0`]).
+    ///    ([`crate::transport::ALPN_NERW_WIRE_PROTOCOL_1_0_0`]).
     /// 2. Client sends а voice/start RPC method (blocks until the
     ///    server acknowledges the handshake).
     /// 3. Server-side handler reaches into the dispatcher и registers
@@ -630,7 +630,7 @@ mod tests {
         let id = loopback_node_id();
         let ctx = DatagramDispatcher::build_context(id);
         assert_eq!(ctx.peer.node_id, id);
-        assert_eq!(ctx.peer.alpn, ALPN_TOLKI_DATAGRAM_2_0_0);
+        assert_eq!(ctx.peer.alpn, ALPN_NERW_DATAGRAM_1_0_0);
         assert!(ctx.auth.is_none());
     }
 
