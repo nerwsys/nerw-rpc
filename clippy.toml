@@ -1,0 +1,11 @@
+cognitive-complexity-threshold = 20
+too-many-lines-threshold = 80
+too-many-arguments-threshold = 8
+type-complexity-threshold = 200
+max-struct-bools = 2
+max-fn-params-bools = 2
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+allow-panic-in-tests = true
+check-private-items = true
+min-ident-chars-threshold = 2
