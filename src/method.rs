@@ -197,6 +197,19 @@ impl MethodRegistry {
     pub fn len(&self) -> usize {
         self.handlers.len()
     }
+
+    /// All registered method names, sorted ascending.
+    ///
+    /// Returned в lexicographic order для determinism — the underlying
+    /// `HashMap` does NOT preserve insertion order. Used by the
+    /// built-in `schema_get` method to surface the registry contents
+    /// to remote callers.
+    #[must_use]
+    pub fn method_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.handlers.keys().cloned().collect();
+        names.sort();
+        names
+    }
 }
 
 #[cfg(test)]

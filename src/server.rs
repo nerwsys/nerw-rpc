@@ -526,6 +526,30 @@ async fn run_connection_loop(
     }
 }
 
+/// Handle one inbound unary RPC stream — read request, dispatch, write
+/// response.
+///
+/// Public entry point so downstream daemon crates can drive the
+/// unary-stream protocol from their own ALPN dispatchers без having
+/// к re-implement the wire framing. The function reads the request
+/// frame off `recv`, looks up the method on `registry`, invokes the
+/// handler с а freshly-built [`RpcContext`], and writes either а
+/// success или typed-error response frame back на `send`.
+///
+/// Errors are logged at `debug` level и not propagated — the stream
+/// is best-effort; а serialization failure mid-flight is no different
+/// from а dropped QUIC stream и handled the same way (the caller's
+/// `read_to_end` returns short и they observe the loss).
+pub async fn handle_unary_stream_public(
+    connection: Connection,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+    registry: Arc<MethodRegistry>,
+    connection_id: u64,
+) {
+    handle_unary_stream(connection, send, recv, registry, connection_id).await;
+}
+
 /// Handle one inbound unary RPC stream — read request, dispatch, write response.
 async fn handle_unary_stream(
     connection: Connection,

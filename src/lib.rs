@@ -61,6 +61,7 @@ pub mod context;
 pub mod datagram;
 pub mod error;
 pub mod method;
+pub mod schema;
 pub mod server;
 pub mod transit;
 pub mod transport;
@@ -76,6 +77,9 @@ pub use crate::context::{
 pub use crate::datagram::{DEFAULT_MAX_CONCURRENT_DATAGRAMS, DatagramDispatcher, DatagramHandler};
 pub use crate::error::{RpcError, RpcResult};
 pub use crate::method::{MethodHandler, MethodName, MethodRegistry};
+pub use crate::schema::{
+    METHOD_SCHEMA_GET, SchemaError, SchemaHandler, SchemaResponse, register_schema_method,
+};
 pub use crate::server::{
     DEFAULT_MAX_CONCURRENT_CONNECTIONS, DEFAULT_MAX_CONCURRENT_STREAMS, RpcServer, RpcServerConfig,
 };
