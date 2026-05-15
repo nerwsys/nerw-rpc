@@ -37,7 +37,7 @@
 //!
 //! ## ALPN routing (owned by [`crate::server::RpcServer`] internally)
 //!
-//! - `nerw/wire-protocol/1.0.0` — bidi RPC streams (request/response,
+//! - `nerw/rpc/1.0.0` — bidi RPC streams (request/response,
 //!   server-streaming, client-streaming, bidi). Dispatched к the
 //!   private wire-handler by [`crate::server::RpcServer::serve`]; opened
 //!   on demand by [`crate::client::RpcClient::call`] on the client side
@@ -77,7 +77,7 @@ use crate::error::RpcResult;
 /// [`crate::client::RpcClient::call`] on the client side via
 /// [`nerw_core::client::Client::dial_with_alpn`] +
 /// [`nerw_core::client::Client::open_substream`].
-pub const ALPN_NERW_WIRE_PROTOCOL_1_0_0: &[u8] = b"nerw/wire-protocol/1.0.0";
+pub const ALPN_NERW_RPC_1_0_0: &[u8] = b"nerw/rpc/1.0.0";
 
 /// Unreliable datagram ALPN — voice / RTP and other unreliable
 /// subprotocols.
@@ -151,7 +151,7 @@ pub const ALPN_NERW_TRANSIT_1_0_0: &[u8] = b"nerw/transit/1.0.0";
 /// }
 /// ```
 pub const NERW_RPC_ALPNS: &[&[u8]] = &[
-    ALPN_NERW_WIRE_PROTOCOL_1_0_0,
+    ALPN_NERW_RPC_1_0_0,
     ALPN_NERW_DATAGRAM_1_0_0,
     ALPN_NERW_MESH_1_0_0,
     ALPN_NERW_TRANSIT_1_0_0,
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn nerw_rpc_alpns_covers_every_advertised_constant() {
-        assert!(NERW_RPC_ALPNS.contains(&ALPN_NERW_WIRE_PROTOCOL_1_0_0));
+        assert!(NERW_RPC_ALPNS.contains(&ALPN_NERW_RPC_1_0_0));
         assert!(NERW_RPC_ALPNS.contains(&ALPN_NERW_DATAGRAM_1_0_0));
         assert!(NERW_RPC_ALPNS.contains(&ALPN_NERW_MESH_1_0_0));
         assert!(NERW_RPC_ALPNS.contains(&ALPN_NERW_TRANSIT_1_0_0));
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn alpn_constants_have_expected_byte_strings() {
-        assert_eq!(ALPN_NERW_WIRE_PROTOCOL_1_0_0, b"nerw/wire-protocol/1.0.0");
+        assert_eq!(ALPN_NERW_RPC_1_0_0, b"nerw/rpc/1.0.0");
         assert_eq!(ALPN_NERW_DATAGRAM_1_0_0, b"nerw/datagram/1.0.0");
         assert_eq!(ALPN_NERW_MESH_1_0_0, b"nerw/mesh/1.0.0");
         assert_eq!(ALPN_NERW_TRANSIT_1_0_0, b"nerw/transit/1.0.0");

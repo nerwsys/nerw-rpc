@@ -1,6 +1,6 @@
 [package]
 name = "nerw-rpc"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Mesh-agnostic RPC framework over iroh with WIT contracts + postcard wire format"

@@ -63,7 +63,7 @@ use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, SecretKey, TransportAddr};
 use nerw_core::client::{Client, ClientConfig};
 use nerw_rpc::{
-    ALPN_NERW_DATAGRAM_1_0_0, ALPN_NERW_MESH_1_0_0, ALPN_NERW_WIRE_PROTOCOL_1_0_0, AlpnHandler,
+    ALPN_NERW_DATAGRAM_1_0_0, ALPN_NERW_MESH_1_0_0, ALPN_NERW_RPC_1_0_0, AlpnHandler,
     DatagramDispatcher, DatagramHandler, IrohTransportClient, MethodHandler, MethodRegistry,
     RpcClient, RpcContext, RpcError, RpcResult, RpcServer, RpcServerConfig, wire::encode_stream_id,
 };
@@ -101,7 +101,7 @@ fn make_test_config(tmp: &TempDir, label: &str) -> Result<(ClientConfig, PathBuf
         .with_ca_pem_path(&ca_pem)
         .with_relay_url("https://127.0.0.1:1/")
         .with_alpn(ALPN_NERW_MESH_1_0_0.to_vec())
-        .with_alpn(ALPN_NERW_WIRE_PROTOCOL_1_0_0.to_vec())
+        .with_alpn(ALPN_NERW_RPC_1_0_0.to_vec())
         .with_alpn(ALPN_NERW_DATAGRAM_1_0_0.to_vec())
         .with_discovery(None)
         .build();
@@ -698,7 +698,7 @@ async fn malformed_inbound_does_not_crash_server() -> Result<()> {
     // because it auto-frames с OPCODE_UNARY_REQUEST.
     let alpha_inner = Arc::clone(fix.alpha_transport.inner());
     let (mut send, mut recv) = alpha_inner
-        .open_substream(&bravo_id, ALPN_NERW_WIRE_PROTOCOL_1_0_0)
+        .open_substream(&bravo_id, ALPN_NERW_RPC_1_0_0)
         .await
         .context("open_substream")?;
 

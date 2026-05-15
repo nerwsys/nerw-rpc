@@ -89,6 +89,6 @@ pub use crate::transit::{
 };
 pub use crate::transport::{
     ALPN_NERW_DATAGRAM_1_0_0, ALPN_NERW_MESH_1_0_0, ALPN_NERW_TRANSIT_1_0_0,
-    ALPN_NERW_WIRE_PROTOCOL_1_0_0, AlpnHandler, IrohTransportClient, NERW_RPC_ALPNS,
+    ALPN_NERW_RPC_1_0_0, AlpnHandler, IrohTransportClient, NERW_RPC_ALPNS,
 };
 pub use crate::wire_error::WireError;

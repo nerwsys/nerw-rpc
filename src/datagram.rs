@@ -383,7 +383,7 @@ impl DatagramDispatcher {
     ///
     /// The established voice subprotocol pattern is:
     /// 1. Client opens а bidi stream к responder's wire-protocol ALPN
-    ///    ([`crate::transport::ALPN_NERW_WIRE_PROTOCOL_1_0_0`]).
+    ///    ([`crate::transport::ALPN_NERW_RPC_1_0_0`]).
     /// 2. Client sends а voice/start RPC method (blocks until the
     ///    server acknowledges the handshake).
     /// 3. Server-side handler reaches into the dispatcher и registers
