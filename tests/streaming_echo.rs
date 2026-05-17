@@ -6,6 +6,10 @@
     clippy::wildcard_enum_match_arm,
     clippy::default_numeric_fallback,
     clippy::arithmetic_side_effects,
+    // `Err(_) => panic!("timed out")` is the canonical narrow assertion for
+    // tokio::time::timeout in tests — the only error variant `timeout()`
+    // produces is `Elapsed`, so the wildcard is a hard upper bound.
+    clippy::match_wild_err_arm,
 )]
 
 //! Bidi streaming roundtrip tests (Phase 3, NRW-RPC-BIDI-STREAMING-001).

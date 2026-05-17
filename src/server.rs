@@ -101,15 +101,25 @@ pub const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 256;
 /// preserving correctness while bounding resource usage.
 pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
-/// QUIC application-layer close code: peer attempted а connection on
-/// an ALPN with no registered handler. The inbound side closes the
-/// connection immediately so the peer learns the protocol is unbound
-/// rather than hanging on а silently-discarded handshake.
+/// QUIC application-layer close code for "no handler registered".
+///
+/// Peer attempted а connection on an ALPN with no registered handler.
+/// The inbound side closes the connection immediately so the peer learns
+/// the protocol is unbound rather than hanging on а silently-discarded
+/// handshake.
 ///
 /// Surfaced as а named constant so future close-code allocations are
 /// visible в one place, and accidental collisions across call sites
 /// fail at compile time.
 const CLOSE_NO_HANDLER: u32 = 1;
+
+/// Internal type alias for the ALPN handler dispatch table.
+///
+/// Keyed by ALPN bytes; value is the `Arc<dyn AlpnHandler>` to run на
+/// inbound connections that negotiated that ALPN. Shared between
+/// [`RpcServer`] (where registration happens) and the accept-loop task
+/// (where dispatch happens) via `Arc::clone`.
+type AlpnHandlerTable = Arc<DashMap<Vec<u8>, Arc<dyn AlpnHandler>>>;
 
 /// Tunable knobs for [`RpcServer`].
 ///
@@ -164,7 +174,7 @@ pub struct RpcServer {
     /// Internal ALPN dispatch table — keyed by negotiated ALPN bytes.
     /// [`Self::serve`] installs the built-in wire-protocol handler;
     /// callers can add more via [`Self::register_alpn_handler`].
-    alpn_handlers: Arc<DashMap<Vec<u8>, Arc<dyn AlpnHandler>>>,
+    alpn_handlers: AlpnHandlerTable,
     /// Handle к the spawned accept loop task, wrapped в а sync mutex
     /// so [`Self::serve`] takes `&self` (not `&mut self`) и preserves
     /// the Phase 2 public API. `None` before [`Self::serve`] runs;
@@ -379,10 +389,7 @@ impl Drop for RpcServer {
 /// same `DashMap`. Lookup is scoped (we don't hold the entry across
 /// `.await` on the handler call) so concurrent `register_alpn_handler`
 /// calls during accept are safe.
-async fn run_accept_loop(
-    client: Arc<nerw_core::client::Client>,
-    handlers: Arc<DashMap<Vec<u8>, Arc<dyn AlpnHandler>>>,
-) {
+async fn run_accept_loop(client: Arc<nerw_core::client::Client>, handlers: AlpnHandlerTable) {
     loop {
         let Some(incoming) = client.accept().await else {
             debug!("RpcServer accept loop: endpoint closed");
