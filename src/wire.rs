@@ -1,6 +1,6 @@
 //! Wire frame format constants + helpers.
 //!
-//! ## Frame layouts (per `NERW-RPC-DESIGN.md` Section 4)
+//! ## Frame layouts (per `NERW-RPC-DESIGN.md` Section 4 + wit/nerw-rpc.wit)
 //!
 //! ```text
 //! UNARY:
@@ -8,10 +8,14 @@
 //!   Server → Client: [opcode=0x01 | postcard(response)]    # success
 //!                    [opcode=0x02 | postcard(error)]       # error
 //!
-//! STREAMING (single bidi stream):
-//!   Open:        [opcode=0x10 | varint(name_len) | method-name | postcard(open)]
-//!   Item:        [opcode=0x11 | postcard(item)]
-//!   End:         [opcode=0x12 | optional-postcard(trailer)]
+//! STREAMING (single bidi stream, Phase 3 — v0.9.0):
+//!   Open req:    [opcode=0x10 | varint(payload_len) | postcard(StreamingOpenRequest)]
+//!   Open ack:    [opcode=0x11 | varint(payload_len) | postcard(StreamingOpenResponse)]
+//!   Req chunk:   [opcode=0x20 | varint(payload_len) | bytes]
+//!   Resp chunk:  [opcode=0x21 | varint(payload_len) | bytes]
+//!   Req end:     [opcode=0x30]                              # no payload
+//!   Resp end:    [opcode=0x31]                              # no payload
+//!   Stream err:  [opcode=0x40 | varint(payload_len) | postcard(StreamingError)]
 //!
 //! DATAGRAM (WebTransport-style stream-id correlation):
 //!   [varint(stream-id) | postcard(item)]
@@ -22,6 +26,16 @@
 //! boundary (Phase 2) where it knows how to emit/consume from a QUIC stream.
 
 use crate::error::{RpcError, RpcResult};
+
+/// Hard upper bound on а single streaming payload-frame body (in bytes).
+///
+/// Each `[opcode | varint(len) | bytes]` frame on the streaming wire is
+/// bounded by this constant before we allocate the read buffer. Picked
+/// at 8 MiB to match the unary `RPC_STREAM_READ_LIMIT` so callers can
+/// reason about а single «message size» limit across the framework.
+/// А malicious peer cannot trick the decoder into pre-allocating
+/// gigabytes по а bogus varint.
+pub const MAX_STREAMING_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 
 /// Hard upper bound on method-name length (in bytes) accepted on the wire.
 ///
@@ -40,12 +54,54 @@ pub const OPCODE_UNARY_RESPONSE: u8 = 0x01;
 /// Unary error response opcode.
 pub const OPCODE_UNARY_ERROR: u8 = 0x02;
 
-/// Streaming "open" opcode — first frame on a bidi stream that names the method.
-pub const OPCODE_STREAM_OPEN: u8 = 0x10;
-/// Streaming "item" opcode — subsequent payload frames in either direction.
-pub const OPCODE_STREAM_ITEM: u8 = 0x11;
-/// Streaming "end" opcode — final frame, optionally carries a trailer.
-pub const OPCODE_STREAM_END: u8 = 0x12;
+/// Streaming open-request opcode (client → server, Phase 3).
+///
+/// First frame on а streaming substream — carries `StreamingOpenRequest`
+/// `{ method_name: String, request_id: u64 }` postcard-encoded after а
+/// LEB128 length prefix.
+pub const OPCODE_STREAMING_OPEN_REQUEST: u8 = 0x10;
+
+/// Streaming open-response opcode (server → client, Phase 3).
+///
+/// Acknowledgement of `StreamingOpenRequest`. Carries `StreamingOpenResponse`
+/// `{ status, request_id }` where `status = ok | error(String)`. If the
+/// status is an error the server closes both halves of the substream
+/// after writing this frame.
+pub const OPCODE_STREAMING_OPEN_RESPONSE: u8 = 0x11;
+
+/// Streaming request-chunk opcode (client → server, Phase 3).
+///
+/// Wire shape: `[opcode | varint(payload_len) | bytes]`. Payload contents
+/// are caller-defined (typically а postcard-encoded application message).
+pub const OPCODE_STREAMING_REQUEST_CHUNK: u8 = 0x20;
+
+/// Streaming response-chunk opcode (server → client, Phase 3).
+///
+/// Same wire shape as [`OPCODE_STREAMING_REQUEST_CHUNK`].
+pub const OPCODE_STREAMING_RESPONSE_CHUNK: u8 = 0x21;
+
+/// Streaming request-end opcode (client → server, Phase 3).
+///
+/// Single byte. Signals «client will send no more request chunks» — the
+/// server's request-stream view yields `None` after seeing this frame.
+/// The client closes its send half after writing this byte.
+pub const OPCODE_STREAMING_REQUEST_END: u8 = 0x30;
+
+/// Streaming response-end opcode (server → client, Phase 3).
+///
+/// Single byte. Signals clean close — client's response stream ends
+/// gracefully without an error. The server closes its send half after
+/// writing this byte.
+pub const OPCODE_STREAMING_RESPONSE_END: u8 = 0x31;
+
+/// Streaming mid-stream error opcode (either direction, Phase 3).
+///
+/// Carries `StreamingError` `{ message: String, terminal: bool }`. If
+/// `terminal = true` the sender closes its send half after this frame
+/// and the receiver surfaces а typed error. If `terminal = false` the
+/// stream stays open — the next frame proceeds as if the error were
+/// а recoverable per-chunk failure.
+pub const OPCODE_STREAMING_ERROR: u8 = 0x40;
 
 /// Encode a method-name prefix as `varint(name_len) || UTF-8 bytes`.
 ///
@@ -226,9 +282,14 @@ mod tests {
         assert_eq!(OPCODE_UNARY_REQUEST, 0x00);
         assert_eq!(OPCODE_UNARY_RESPONSE, 0x01);
         assert_eq!(OPCODE_UNARY_ERROR, 0x02);
-        assert_eq!(OPCODE_STREAM_OPEN, 0x10);
-        assert_eq!(OPCODE_STREAM_ITEM, 0x11);
-        assert_eq!(OPCODE_STREAM_END, 0x12);
+        // Phase 3 streaming opcodes — see wit/nerw-rpc.wit.
+        assert_eq!(OPCODE_STREAMING_OPEN_REQUEST, 0x10);
+        assert_eq!(OPCODE_STREAMING_OPEN_RESPONSE, 0x11);
+        assert_eq!(OPCODE_STREAMING_REQUEST_CHUNK, 0x20);
+        assert_eq!(OPCODE_STREAMING_RESPONSE_CHUNK, 0x21);
+        assert_eq!(OPCODE_STREAMING_REQUEST_END, 0x30);
+        assert_eq!(OPCODE_STREAMING_RESPONSE_END, 0x31);
+        assert_eq!(OPCODE_STREAMING_ERROR, 0x40);
     }
 
     #[test]
