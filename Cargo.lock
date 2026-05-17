@@ -1947,12 +1947,13 @@ dependencies = [
 
 [[package]]
 name = "nerw-rpc"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
  "dashmap",
+ "futures-util",
  "iroh",
  "leb128",
  "nerw-core",
@@ -1964,6 +1965,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
  "tracing",
  "uuid",
 ]

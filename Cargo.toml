@@ -1,6 +1,6 @@
 [package]
 name = "nerw-rpc"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Mesh-agnostic RPC framework over iroh with WIT contracts + postcard wire format"
@@ -20,6 +20,15 @@ tracing = "0.1"
 leb128 = "0.2"
 uuid = { version = "1.7", features = ["v4", "serde"] }
 async-trait = "0.1"
+# `futures-util` — needed для `BoxStream` type alias used в the public
+# `StreamingMethodHandler` trait (Phase 3 bidi streaming, v0.9.0). Only
+# the alloc + std features pulled by default; we use the type alias и а
+# couple of stream adapters (`StreamExt::next`) — no heavy executors.
+futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+# `tokio-stream` — provides `ReceiverStream` wrapper that adapts
+# `mpsc::Receiver` to а `Stream`, used by the streaming dispatch path to
+# expose the inbound request channel as а `BoxStream` for handlers.
+tokio-stream = "0.1"
 
 # Phase 2 — iroh transport binding (path dep к local nerw-core checkout).
 #
