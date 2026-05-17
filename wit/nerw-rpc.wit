@@ -1,0 +1,141 @@
+// nerw-rpc — WIT contract for the wire protocol envelope.
+//
+// This file documents the on-wire envelope around postcard-encoded
+// application payloads. Per-method request/response types are owned by
+// downstream WIT files (e.g. `tolki-server` ships its own
+// `chat.wit` / `agents.wit`) and are not re-declared here.
+//
+// Version: 0.9.0
+//
+// Status:
+//   - unary path: shipped in 0.8.0
+//   - bidi streaming: shipped in 0.9.0 (this file's `streaming` section)
+
+package nerw:rpc@0.9.0;
+
+interface envelope {
+    /// Opcode discriminants on the wire. The first byte of every frame
+    /// on a `nerw/rpc/1.0.0` bidi substream is one of these. Opcodes
+    /// 0x00..=0x0F are reserved for the unary call path, 0x10..=0x4F
+    /// for the streaming call path.
+    enum opcode {
+        /// Client → Server: `[0x00 | varint(name_len) | method-name UTF-8 | postcard(request)]`.
+        /// First frame on a unary substream.
+        unary-request,        // 0x00
+        /// Server → Client: `[0x01 | postcard(response)]`. Closes the send half.
+        unary-response,       // 0x01
+        /// Server → Client: `[0x02 | postcard(wire-error)]`. Closes the send half.
+        unary-error,          // 0x02
+
+        /// Client → Server (first frame on a streaming substream):
+        /// `[0x10 | varint(payload_len) | postcard(streaming-open-request)]`.
+        /// `streaming-open-request = { method_name: string, request_id: u64 }`.
+        streaming-open-request,    // 0x10
+        /// Server → Client (acknowledgement of `streaming-open-request`):
+        /// `[0x11 | varint(payload_len) | postcard(streaming-open-response)]`.
+        /// `streaming-open-response = { status: status, request_id: u64 }`
+        /// where `status = ok | error(string)`.
+        ///
+        /// On `status = error(...)`, the server closes both halves of the
+        /// substream after writing this frame and the client surfaces a
+        /// typed `RpcError` (typically `UnknownMethod`).
+        streaming-open-response,   // 0x11
+
+        /// Client → Server payload chunk:
+        /// `[0x20 | varint(payload_len) | bytes]`.
+        /// Payload contents are caller-defined (typically postcard-encoded
+        /// per the application's WIT contract). Repeats until the client
+        /// drops its sender (which emits `streaming-request-end`).
+        streaming-request-chunk,   // 0x20
+        /// Server → Client payload chunk: same wire shape as request chunk.
+        /// Repeats until the server emits `streaming-response-end` or
+        /// `streaming-error{terminal=true}`.
+        streaming-response-chunk,  // 0x21
+
+        /// Client → Server: `[0x30]`. No payload. Signals "client will
+        /// send no more request chunks". Client closes its send half after
+        /// this frame. Server's request-stream view yields `None` next.
+        streaming-request-end,     // 0x30
+        /// Server → Client: `[0x31]`. No payload. Signals "server will
+        /// send no more response chunks" (clean close). Client's response
+        /// stream ends gracefully on receipt.
+        streaming-response-end,    // 0x31
+
+        /// Either direction, mid-stream error:
+        /// `[0x40 | varint(payload_len) | postcard(streaming-error)]`.
+        /// `streaming-error = { message: string, terminal: bool }`.
+        /// If `terminal = true`, the sender closes the substream after
+        /// this frame and the receiver surfaces a typed `RpcError`. If
+        /// `terminal = false`, the stream remains open for further frames
+        /// (e.g. partial-batch failure that the recipient can recover from).
+        streaming-error,           // 0x40
+    }
+
+    /// First-frame body for streaming opens. Postcard-encoded with the
+    /// usual positional layout (no field tags).
+    record streaming-open-request-body {
+        method-name: string,
+        request-id: u64,
+    }
+
+    /// First-frame ack body. `status` is a discriminated union: 0 = ok,
+    /// 1 = error(message: string). Postcard-encoded.
+    variant streaming-open-status {
+        ok,
+        error(string),
+    }
+
+    record streaming-open-response-body {
+        status: streaming-open-status,
+        request-id: u64,
+    }
+
+    /// Mid-stream error body.
+    record streaming-error-body {
+        message: string,
+        terminal: bool,
+    }
+}
+
+interface streaming {
+    use envelope.{opcode, streaming-open-request-body, streaming-open-response-body, streaming-error-body};
+
+    /// Bidi streaming call lifecycle (per substream):
+    ///
+    /// 1. Client opens a fresh QUIC bidi substream negotiated with ALPN
+    ///    `nerw/rpc/1.0.0`.
+    /// 2. Client writes `streaming-open-request` (opcode `0x10`) carrying
+    ///    `streaming-open-request-body`. Client then begins streaming
+    ///    `streaming-request-chunk` (opcode `0x20`) frames at will.
+    /// 3. Server reads the open-request, dispatches to the matching
+    ///    streaming handler, and writes `streaming-open-response`
+    ///    (opcode `0x11`) carrying `streaming-open-response-body`. If
+    ///    `status = error(...)`, the server closes the substream — no
+    ///    chunks flow in either direction.
+    /// 4. Both sides exchange chunks freely. Either may send `streaming-error`
+    ///    (opcode `0x40`) at any time.
+    /// 5. Termination:
+    ///    - Client drops its sender → emits `streaming-request-end`
+    ///      (opcode `0x30`) and closes its send half.
+    ///    - Server's handler returns `Ok(())` → emits `streaming-response-end`
+    ///      (opcode `0x31`) and closes its send half.
+    ///    - Either side emits `streaming-error{terminal=true}` (opcode
+    ///      `0x40`) → that side closes its send half; receiver surfaces
+    ///      the error and ends its receive stream.
+    ///
+    /// Backward compatibility: a server that does NOT support streaming
+    /// (e.g. an older nerw-rpc 0.8.x build) sees an unknown opcode `0x10`
+    /// on the substream and writes `unary-error` with a malformed-frame
+    /// `WireError` payload — clients can detect this and downgrade.
+    ///
+    /// Note on framing: each streaming frame is length-prefixed via LEB128
+    /// varint AFTER the opcode byte for `streaming-open-*`,
+    /// `streaming-*-chunk`, and `streaming-error`. The two `*-end` frames
+    /// carry no payload and are a single opcode byte on the wire.
+    record protocol-stub {}
+}
+
+world rpc-framework {
+    export envelope;
+    export streaming;
+}
