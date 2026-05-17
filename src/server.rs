@@ -64,10 +64,13 @@ use tracing::{debug, trace, warn};
 use crate::context::{PeerMetadata, RpcContext, TimingInfo, TracingInfo};
 use crate::error::{RpcError, RpcResult};
 use crate::method::MethodRegistry;
+use crate::streaming::{
+    self, StreamingFrame, StreamingMethodHandler, StreamingOpenResponse, StreamingOpenStatus,
+};
 use crate::transport::{ALPN_NERW_RPC_1_0_0, AlpnHandler, IrohTransportClient};
 use crate::wire::{
-    OPCODE_UNARY_ERROR, OPCODE_UNARY_REQUEST, OPCODE_UNARY_RESPONSE, decode_method_name,
-    encode_method_name,
+    OPCODE_STREAMING_OPEN_REQUEST, OPCODE_UNARY_ERROR, OPCODE_UNARY_REQUEST, OPCODE_UNARY_RESPONSE,
+    decode_method_name, encode_method_name,
 };
 use crate::wire_error::WireError;
 
@@ -514,7 +517,7 @@ async fn run_connection_loop(
                             return;
                         }
                     };
-                    handle_unary_stream(conn, send, recv, registry, connection_id).await;
+                    handle_inbound_substream(conn, send, recv, registry, connection_id).await;
                     drop(permit);
                 });
             }
@@ -547,11 +550,17 @@ pub async fn handle_unary_stream_public(
     registry: Arc<MethodRegistry>,
     connection_id: u64,
 ) {
-    handle_unary_stream(connection, send, recv, registry, connection_id).await;
+    handle_inbound_substream(connection, send, recv, registry, connection_id).await;
 }
 
-/// Handle one inbound unary RPC stream — read request, dispatch, write response.
-async fn handle_unary_stream(
+/// Dispatch one inbound substream by peeking its first opcode byte.
+///
+/// `OPCODE_UNARY_REQUEST` (0x00) routes к the unary read-to-end path
+/// (existing v0.8.x behaviour). `OPCODE_STREAMING_OPEN_REQUEST` (0x10)
+/// routes к the new streaming dispatch (v0.9.0). Any other opening
+/// byte yields а malformed-frame error written back as а unary error
+/// frame so the client surfaces it cleanly.
+async fn handle_inbound_substream(
     connection: Connection,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
@@ -559,20 +568,78 @@ async fn handle_unary_stream(
     connection_id: u64,
 ) {
     let remote = connection.remote_id();
-    // Capture monotonic + wall-clock at the earliest possible point so
-    // latency measurements include time spent в stream-read.
     let accept_instant = std::time::Instant::now();
     let stream_id_u64 = u64::from(send.id());
-    // read_to_end returns Vec<u8>; freeze к Bytes once и slice through
-    // the dispatch path так handlers receive а ref-counted view с no
-    // further copying.
-    let buf: Bytes = match recv.read_to_end(RPC_STREAM_READ_LIMIT).await {
+
+    let mut opcode_buf = [0_u8; 1];
+    if let Err(e) = recv.read_exact(&mut opcode_buf).await {
+        debug!(remote = %remote, error = %e, "inbound RPC stream: failed to read opening opcode");
+        return;
+    }
+    let opcode = opcode_buf[0];
+
+    if opcode == OPCODE_STREAMING_OPEN_REQUEST {
+        handle_streaming_substream(
+            connection,
+            send,
+            recv,
+            registry,
+            accept_instant,
+            connection_id,
+            stream_id_u64,
+        )
+        .await;
+        return;
+    }
+
+    if opcode != OPCODE_UNARY_REQUEST {
+        let err = RpcError::MalformedFrame(format!(
+            "expected unary-request (0x00) or streaming-open (0x10), got 0x{opcode:02x}"
+        ));
+        if let Err(e) = write_error(&mut send, &err).await {
+            debug!(remote = %remote, error = %e, "failed to write malformed-frame error");
+        }
+        return;
+    }
+
+    handle_unary_stream_with_opcode_consumed(
+        connection,
+        send,
+        recv,
+        registry,
+        accept_instant,
+        connection_id,
+        stream_id_u64,
+    )
+    .await;
+}
+
+/// Continue the existing unary dispatch path after the opening opcode
+/// byte has already been consumed by [`handle_inbound_substream`].
+async fn handle_unary_stream_with_opcode_consumed(
+    connection: Connection,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    registry: Arc<MethodRegistry>,
+    accept_instant: std::time::Instant,
+    connection_id: u64,
+    stream_id_u64: u64,
+) {
+    let remote = connection.remote_id();
+    // Read the remainder (method-name + payload). The opcode byte was
+    // already consumed so we recover the full frame с а 1-byte prefix
+    // recombination — handlers downstream expect the original wire layout.
+    let tail: Bytes = match recv.read_to_end(RPC_STREAM_READ_LIMIT).await {
         Ok(v) => Bytes::from(v),
         Err(e) => {
-            debug!(remote = %remote, error = %e, "inbound RPC stream: read_to_end failed");
+            debug!(remote = %remote, error = %e, "inbound unary stream: read_to_end failed");
             return;
         }
     };
+    let mut buf_vec = Vec::with_capacity(tail.len().saturating_add(1));
+    buf_vec.push(OPCODE_UNARY_REQUEST);
+    buf_vec.extend_from_slice(&tail);
+    let buf = Bytes::from(buf_vec);
 
     match dispatch_unary(
         buf,
@@ -593,6 +660,250 @@ async fn handle_unary_stream(
             // Best-effort — ignore write failure on the error frame itself.
             if let Err(e) = write_error(&mut send, &err).await {
                 debug!(remote = %remote, error = %e, "failed to write error response");
+            }
+        }
+    }
+}
+
+/// Handle one inbound streaming substream after [`OPCODE_STREAMING_OPEN_REQUEST`]
+/// has been observed.
+///
+/// Reads the `StreamingOpenRequest` body off `recv`, looks up the
+/// matching streaming handler, writes а [`StreamingOpenResponse`] ack
+/// (`Ok` or `Err(reason)`), spawns request- и response-pump tasks, and
+/// invokes the handler. На clean handler exit emits
+/// [`crate::wire::OPCODE_STREAMING_RESPONSE_END`]; on handler error
+/// emits [`crate::wire::OPCODE_STREAMING_ERROR`] с `terminal = true`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_streaming_substream(
+    connection: Connection,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    registry: Arc<MethodRegistry>,
+    accept_instant: std::time::Instant,
+    connection_id: u64,
+    stream_id_u64: u64,
+) {
+    let remote = connection.remote_id();
+
+    // Phase 1 — read open + lookup handler + write ack.
+    let Some((handler, ctx)) = streaming_negotiate_open(
+        &connection,
+        &mut send,
+        &mut recv,
+        &registry,
+        accept_instant,
+        connection_id,
+        stream_id_u64,
+    )
+    .await
+    else {
+        return;
+    };
+
+    // Phase 2 — set up channels.
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<RpcResult<Bytes>>(16);
+    let (resp_tx, resp_rx) = tokio::sync::mpsc::channel::<RpcResult<Bytes>>(16);
+
+    let req_pump = tokio::spawn(pump_inbound_requests(recv, req_tx));
+    let requests_stream: futures_util::stream::BoxStream<'static, RpcResult<Bytes>> =
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+
+    // Phase 3 — invoke handler + pump responses concurrently.
+    let handler_join =
+        tokio::spawn(async move { handler.handle(ctx, requests_stream, resp_tx).await });
+    let wrote_terminal = drain_handler_responses(&mut send, resp_rx, remote).await;
+
+    // Phase 4 — final close frame.
+    let handler_result = handler_join.await;
+    if !wrote_terminal {
+        finalise_streaming(&mut send, handler_result, remote).await;
+    }
+
+    // Cancel the request-pump in case it's still draining inbound frames.
+    req_pump.abort();
+    let _ = send.finish();
+}
+
+/// Streaming-substream Phase 1 — open negotiation.
+///
+/// Reads the open-request, looks up the handler, writes the open-ack
+/// frame. Returns the resolved handler + context on success или `None`
+/// если the open failed at any step (peer already observes а typed
+/// error in that case).
+#[allow(clippy::too_many_arguments)]
+async fn streaming_negotiate_open(
+    connection: &Connection,
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+    registry: &Arc<MethodRegistry>,
+    accept_instant: std::time::Instant,
+    connection_id: u64,
+    stream_id_u64: u64,
+) -> Option<(Arc<dyn StreamingMethodHandler>, RpcContext)> {
+    let remote = connection.remote_id();
+
+    let open_req = match streaming::read_streaming_frame_after_opcode(
+        recv,
+        OPCODE_STREAMING_OPEN_REQUEST,
+    )
+    .await
+    {
+        Ok(StreamingFrame::OpenRequest(body)) => body,
+        Ok(other) => {
+            debug!(
+                remote = %remote,
+                "streaming substream: expected open-request body, got {other:?}"
+            );
+            return None;
+        }
+        Err(e) => {
+            debug!(remote = %remote, error = %e, "streaming substream: open-request read failed");
+            return None;
+        }
+    };
+
+    let method_name = open_req.method_name.clone();
+    let request_id = open_req.request_id;
+
+    let handler = registry.lookup_streaming(&method_name);
+    let Some(handler) = handler else {
+        let ack = StreamingOpenResponse {
+            status: StreamingOpenStatus::Err(format!("unknown streaming method: {method_name}")),
+            request_id,
+        };
+        if let Err(e) = streaming::write_open_response(send, &ack).await {
+            debug!(remote = %remote, error = %e, "failed to write streaming open-error ack");
+            return None;
+        }
+        let _ = send.finish();
+        return None;
+    };
+
+    let ack = StreamingOpenResponse {
+        status: StreamingOpenStatus::Ok,
+        request_id,
+    };
+    if let Err(e) = streaming::write_open_response(send, &ack).await {
+        debug!(remote = %remote, error = %e, "failed to write streaming open-ack");
+        return None;
+    }
+
+    let frame_decode_duration_us =
+        u64::try_from(accept_instant.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let ctx = build_inbound_context(
+        connection,
+        accept_instant,
+        connection_id,
+        stream_id_u64,
+        frame_decode_duration_us,
+    );
+    Some((handler, ctx))
+}
+
+/// Pump inbound request-side frames off the substream into the channel
+/// the handler observes as its `requests` stream.
+///
+/// Loops until the client emits `STREAMING_REQUEST_END`, а terminal
+/// error frame, or the underlying read fails. Errors are forwarded
+/// в-band so the handler can decide whether к surface them.
+async fn pump_inbound_requests(
+    mut recv: iroh::endpoint::RecvStream,
+    req_tx: tokio::sync::mpsc::Sender<RpcResult<Bytes>>,
+) {
+    loop {
+        match streaming::read_streaming_frame(&mut recv).await {
+            Ok(Some(StreamingFrame::RequestChunk(bytes))) => {
+                if req_tx.send(Ok(bytes)).await.is_err() {
+                    return;
+                }
+            }
+            // Both а clean end-of-requests frame и а bare-EOF on read
+            // map to «no more requests» from the handler's PoV.
+            Ok(Some(StreamingFrame::RequestEnd) | None) => return,
+            Ok(Some(StreamingFrame::Error(err))) => {
+                let surfaced = RpcError::Handler(err.message.clone().into());
+                let _ = req_tx.send(Err(surfaced)).await;
+                if err.terminal {
+                    return;
+                }
+            }
+            Ok(Some(other)) => {
+                let _ = req_tx
+                    .send(Err(RpcError::MalformedFrame(format!(
+                        "unexpected client→server frame: {other:?}"
+                    ))))
+                    .await;
+                return;
+            }
+            Err(e) => {
+                let _ = req_tx.send(Err(e)).await;
+                return;
+            }
+        }
+    }
+}
+
+/// Drain the handler's response channel и write each item out as
+/// either а chunk или а terminal error frame.
+///
+/// Returns `true` если а terminal frame was already written (handler
+/// emitted an `Err` over the response sender или а write itself failed)
+/// — the outer dispatch then skips the [`finalise_streaming`] step.
+async fn drain_handler_responses(
+    send: &mut iroh::endpoint::SendStream,
+    mut resp_rx: tokio::sync::mpsc::Receiver<RpcResult<Bytes>>,
+    remote: nerw_core::identity::NodeId,
+) -> bool {
+    while let Some(item) = resp_rx.recv().await {
+        match item {
+            Ok(chunk) => {
+                if let Err(e) = streaming::write_response_chunk(send, &chunk).await {
+                    debug!(remote = %remote, error = %e, "failed to write streaming response chunk");
+                    return true;
+                }
+            }
+            Err(err) => {
+                let body = streaming::handler_err_to_terminal(&err);
+                if let Err(e) = streaming::write_streaming_error(send, &body).await {
+                    debug!(remote = %remote, error = %e, "failed to write streaming terminal error");
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Final close frame after handler-task completion.
+///
+/// Emits either `STREAMING_RESPONSE_END` (clean handler exit), а
+/// terminal error frame (handler returned `Err`), или а join-failure
+/// terminal error (handler task panicked / was cancelled).
+async fn finalise_streaming(
+    send: &mut iroh::endpoint::SendStream,
+    handler_result: Result<RpcResult<()>, tokio::task::JoinError>,
+    remote: nerw_core::identity::NodeId,
+) {
+    match handler_result {
+        Ok(Ok(())) => {
+            if let Err(e) = streaming::write_response_end(send).await {
+                debug!(remote = %remote, error = %e, "failed to write streaming response-end");
+            }
+        }
+        Ok(Err(handler_err)) => {
+            let body = streaming::handler_err_to_terminal(&handler_err);
+            if let Err(e) = streaming::write_streaming_error(send, &body).await {
+                debug!(remote = %remote, error = %e, "failed to write handler-error frame");
+            }
+        }
+        Err(join_err) => {
+            let body = streaming::StreamingError {
+                message: format!("streaming handler join failure: {join_err}"),
+                terminal: true,
+            };
+            if let Err(e) = streaming::write_streaming_error(send, &body).await {
+                debug!(remote = %remote, error = %e, "failed to write join-failure frame");
             }
         }
     }

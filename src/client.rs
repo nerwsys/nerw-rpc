@@ -29,15 +29,28 @@
 //! merely allocates а logical stream id) but the underlying connection
 //! has been silently dropped after the cache hit.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bytes::Bytes;
+use futures_util::stream::BoxStream;
 use nerw_core::identity::NodeId;
+use tokio::sync::mpsc;
 use tracing::trace;
 
 use crate::error::{RpcError, RpcResult};
 use crate::server::build_unary_request_frame;
+use crate::streaming::{
+    self, StreamingFrame, StreamingOpenRequest, StreamingOpenResponse, StreamingOpenStatus,
+};
 use crate::transport::{ALPN_NERW_RPC_1_0_0, IrohTransportClient};
 use crate::wire::{OPCODE_UNARY_ERROR, OPCODE_UNARY_RESPONSE};
 use crate::wire_error::WireError;
+
+/// Process-wide monotonic counter для streaming `request_id` correlation.
+///
+/// Today nerw-rpc rides one substream per call so the id is
+/// informational; future multiplexed transports use it для disambiguation.
+static STREAMING_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum bytes we accept from а server response — protects clients
 /// against а malicious server trying к exhaust memory by writing forever.
@@ -131,6 +144,104 @@ impl RpcClient {
         result
     }
 
+    /// Open а bidi streaming call (Phase 3 — v0.9.0).
+    ///
+    /// Returns а pair of channels for client→server chunks and the
+    /// server→client response stream. The caller pushes request chunks
+    /// via the [`mpsc::Sender`] и reads responses via the
+    /// [`BoxStream`]. Dropping the sender signals «no more requests»
+    /// (framework writes [`crate::wire::OPCODE_STREAMING_REQUEST_END`]
+    /// и closes the send half); the response stream ends when the
+    /// server sends [`crate::wire::OPCODE_STREAMING_RESPONSE_END`] or а
+    /// terminal [`crate::wire::OPCODE_STREAMING_ERROR`].
+    ///
+    /// `peer` is the target [`NodeId`]. `method_name` follows the
+    /// canonical text format `package[@version]/interface/method` —
+    /// resolved against а handler registered via
+    /// [`crate::method::MethodRegistry::register_streaming`].
+    ///
+    /// # Errors
+    ///
+    /// - [`RpcError::TransportOpenSubstream`] — peer dial or `open_bi` failure.
+    /// - [`RpcError::TransportWrite`]         — failed к write the open-request frame.
+    /// - [`RpcError::TransportRead`]          — failed к read the open-ack frame.
+    /// - [`RpcError::MalformedFrame`]         — unexpected frame type
+    ///   from peer before the open-ack arrived.
+    /// - [`RpcError::UnknownMethod`]          — server reported the method
+    ///   is not registered for streaming.
+    /// - [`RpcError::Codec`]                  — postcard-decoding the
+    ///   ack frame failed.
+    pub async fn call_streaming(
+        &self,
+        peer: &NodeId,
+        method_name: &str,
+    ) -> RpcResult<(mpsc::Sender<Bytes>, BoxStream<'static, RpcResult<Bytes>>)> {
+        let (mut send, mut recv) = self
+            .transport
+            .inner()
+            .open_substream(peer, ALPN_NERW_RPC_1_0_0)
+            .await
+            .map_err(|e| RpcError::TransportOpenSubstream {
+                node_id: format!("{peer}"),
+                reason: format!("{e}"),
+            })?;
+
+        let request_id = STREAMING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let open = StreamingOpenRequest {
+            method_name: method_name.to_owned(),
+            request_id,
+        };
+        streaming::write_open_request(&mut send, &open).await?;
+
+        // Wait for the server's open-ack BEFORE returning the channels —
+        // this turns «unknown method» into а typed `RpcError::UnknownMethod`
+        // surfaced by `call_streaming` itself rather than buried inside
+        // the response stream.
+        let ack_frame = streaming::read_streaming_frame(&mut recv).await?;
+        let Some(StreamingFrame::OpenResponse(StreamingOpenResponse { status, .. })) = ack_frame
+        else {
+            return Err(RpcError::MalformedFrame(format!(
+                "expected streaming open-ack, got {ack_frame:?}"
+            )));
+        };
+        match status {
+            StreamingOpenStatus::Ok => {}
+            StreamingOpenStatus::Err(reason) => {
+                // Heuristic: typical reasons start с "unknown streaming method:";
+                // surface as the canonical typed variant when we can recognise it.
+                if let Some(suffix) = reason.strip_prefix("unknown streaming method: ") {
+                    return Err(RpcError::UnknownMethod(suffix.to_owned()));
+                }
+                return Err(RpcError::Handler(reason.into()));
+            }
+        }
+
+        // Spawn а task that pumps inbound request-side chunks (from the
+        // caller's mpsc) к the wire.
+        let (req_tx, req_rx) = mpsc::channel::<Bytes>(16);
+        let req_task = tokio::spawn(pump_outbound_requests(send, req_rx));
+
+        // Spawn а task that pumps inbound response chunks к the caller-
+        // facing mpsc.
+        let (resp_tx, resp_rx) = mpsc::channel::<RpcResult<Bytes>>(16);
+        tokio::spawn(async move {
+            pump_inbound_responses(recv, resp_tx).await;
+            // Defensive: ensure the request pump finishes before the
+            // task exits so it doesn't outlive the substream.
+            req_task.abort();
+        });
+
+        let stream: BoxStream<'static, RpcResult<Bytes>> =
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(resp_rx));
+        trace!(
+            peer = %peer,
+            method = %method_name,
+            request_id,
+            "RpcClient::call_streaming - open-ack received, channels live",
+        );
+        Ok((req_tx, stream))
+    }
+
     /// Inner body of [`Self::call`] — separated so the N2 eviction
     /// post-check can run on every error path без duplicating the
     /// match arms inline.
@@ -178,6 +289,74 @@ impl RpcClient {
             })?;
 
         decode_response_frame(&Bytes::from(response_buf))
+    }
+}
+
+/// Pump outbound request chunks к the wire until the caller drops the
+/// sender, then emit [`crate::wire::OPCODE_STREAMING_REQUEST_END`] и
+/// `finish()` the send half.
+///
+/// Extracted from `call_streaming` so the streaming dispatch surface fits
+/// в clippy's `too-many-lines-threshold` budget — the loop is а
+/// straight-line pump that does not interact с the open-ack handshake.
+async fn pump_outbound_requests(
+    mut send: iroh::endpoint::SendStream,
+    mut req_rx: mpsc::Receiver<Bytes>,
+) {
+    while let Some(chunk) = req_rx.recv().await {
+        if streaming::write_request_chunk(&mut send, &chunk)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    // Sender dropped — emit the end-of-requests frame и close.
+    let _ = streaming::write_request_end(&mut send).await;
+    let _ = send.finish();
+}
+
+/// Pump inbound response frames к the caller-facing mpsc until the peer
+/// emits [`crate::wire::OPCODE_STREAMING_RESPONSE_END`], а terminal
+/// [`crate::wire::OPCODE_STREAMING_ERROR`], or the stream closes.
+///
+/// Extracted from `call_streaming` for the same reason as
+/// [`pump_outbound_requests`].
+async fn pump_inbound_responses(
+    mut recv: iroh::endpoint::RecvStream,
+    resp_tx: mpsc::Sender<RpcResult<Bytes>>,
+) {
+    loop {
+        match streaming::read_streaming_frame(&mut recv).await {
+            Ok(Some(StreamingFrame::ResponseChunk(bytes))) => {
+                if resp_tx.send(Ok(bytes)).await.is_err() {
+                    // Caller dropped the receiver — stop pumping.
+                    return;
+                }
+            }
+            // Server-side clean close — clean EOF from the read side both
+            // surface as «no more chunks» from the caller's PoV.
+            Ok(Some(StreamingFrame::ResponseEnd) | None) => return,
+            Ok(Some(StreamingFrame::Error(err))) => {
+                let surfaced = RpcError::Handler(err.message.clone().into());
+                let _ = resp_tx.send(Err(surfaced)).await;
+                if err.terminal {
+                    return;
+                }
+            }
+            Ok(Some(other)) => {
+                let _ = resp_tx
+                    .send(Err(RpcError::MalformedFrame(format!(
+                        "unexpected server→client frame: {other:?}"
+                    ))))
+                    .await;
+                return;
+            }
+            Err(e) => {
+                let _ = resp_tx.send(Err(e)).await;
+                return;
+            }
+        }
     }
 }
 

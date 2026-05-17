@@ -15,19 +15,28 @@
 //!
 //! ## Status
 //!
-//! Phase 2.1 — internal refactor onto post-R3 nerw-core surface
-//! (commit `48ec369`). Public API of nerw-rpc preserved
-//! ([`RpcServer::serve`], [`RpcClient::call`],
-//! [`DatagramDispatcher::register`] / [`DatagramDispatcher::unregister`] /
-//! [`DatagramDispatcher::dispatch`]). Phase 2 wire-format intelligence
-//! (ALPN dispatch table, accept loop, per-connection datagram readers)
-//! now lives entirely inside nerw-rpc — nerw-core has been pared down к
-//! pure iroh transport primitives.
+//! Phase 3 — bidi streaming surface (v0.9.0). Adds
+//! [`StreamingMethodHandler`] + [`MethodRegistry::register_streaming`] +
+//! [`RpcClient::call_streaming`] alongside the existing unary path —
+//! one streaming call rides one QUIC bidi substream on the same
+//! `nerw/rpc/1.0.0` ALPN, no second listener required. Wire envelope
+//! documented в `wit/nerw-rpc.wit`.
+//!
+//! Backward compatibility: existing unary [`RpcClient::call`] и
+//! [`MethodHandler`] keep working unchanged — the dispatch layer
+//! discriminates на the opening opcode byte
+//! ([`wire::OPCODE_UNARY_REQUEST`] vs [`wire::OPCODE_STREAMING_OPEN_REQUEST`]).
+//!
+//! Earlier phases:
+//! - Phase 2.1 — internal refactor onto post-R3 nerw-core surface
+//!   (commit `48ec369`); wire-format intelligence (ALPN dispatch table,
+//!   accept loop, per-connection datagram readers) lives entirely inside
+//!   nerw-rpc.
 //!
 //! См. authoritative design в
 //! `/src/tasks/tolki-server/.artifacts/research/NERW-RPC-DESIGN.md`.
 
-#![doc(html_root_url = "https://docs.rs/nerw-rpc/0.6.0")]
+#![doc(html_root_url = "https://docs.rs/nerw-rpc/0.9.0")]
 #![cfg_attr(
     test,
     allow(
@@ -63,6 +72,7 @@ pub mod error;
 pub mod method;
 pub mod schema;
 pub mod server;
+pub mod streaming;
 pub mod transit;
 pub mod transport;
 pub mod wire;
@@ -83,12 +93,16 @@ pub use crate::schema::{
 pub use crate::server::{
     DEFAULT_MAX_CONCURRENT_CONNECTIONS, DEFAULT_MAX_CONCURRENT_STREAMS, RpcServer, RpcServerConfig,
 };
+pub use crate::streaming::{
+    StreamingError, StreamingMethodHandler, StreamingOpenRequest, StreamingOpenResponse,
+    StreamingOpenStatus,
+};
 pub use crate::transit::{
     Capabilities, ConnectOutcome, DEFAULT_RESERVATION_TTL_SECS, Limits, ReserveOutcome,
     TransitError, TransitFrame, Voucher, decode_frame, encode_frame,
 };
 pub use crate::transport::{
-    ALPN_NERW_DATAGRAM_1_0_0, ALPN_NERW_MESH_1_0_0, ALPN_NERW_TRANSIT_1_0_0,
-    ALPN_NERW_RPC_1_0_0, AlpnHandler, IrohTransportClient, NERW_RPC_ALPNS,
+    ALPN_NERW_DATAGRAM_1_0_0, ALPN_NERW_MESH_1_0_0, ALPN_NERW_RPC_1_0_0, ALPN_NERW_TRANSIT_1_0_0,
+    AlpnHandler, IrohTransportClient, NERW_RPC_ALPNS,
 };
 pub use crate::wire_error::WireError;
