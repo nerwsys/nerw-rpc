@@ -85,10 +85,11 @@ fn write_self_signed_ca(dest: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Build а multi-ALPN test [`ClientConfig`] suitable для loopback
-/// nerw-rpc Phase 2.1 tests. Pre-registers ALL three ALPNs the framework
-/// dispatches plus the built-in `nerw/mesh/1.0.0` so the endpoint
-/// accepts every protocol nerw-rpc + nerw-core might negotiate.
+/// Build а multi-ALPN test [`ClientConfig`] suitable для loopback tests.
+///
+/// Pre-registers ALL three ALPNs the framework dispatches plus the
+/// built-in `nerw/mesh/1.0.0` so the endpoint accepts every protocol
+/// nerw-rpc + nerw-core might negotiate.
 ///
 /// Identity is generated in-process via [`SecretKey::generate`] —
 /// post-R3 nerw-core does not own filesystem persistence для identity
@@ -321,8 +322,9 @@ impl DatagramHandler for RecordingDatagramHandler {
     }
 }
 
-/// Custom [`AlpnHandler`] for the datagram ALPN — wires inbound
-/// connections to а [`DatagramDispatcher`] via
+/// Custom [`AlpnHandler`] для the datagram ALPN.
+///
+/// Wires inbound connections to а [`DatagramDispatcher`] via
 /// [`DatagramDispatcher::subscribe_connection`]. Phase 2.1's stand-in
 /// for the gone `subscribe_datagrams` broadcast channel.
 struct DatagramAlpnHandler {
