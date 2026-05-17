@@ -12,9 +12,9 @@
 
 use crate::context::RpcContext;
 use crate::error::RpcResult;
+use crate::streaming::{HandlerEntry, HandlerMap, StreamingMethodHandler};
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Trait для method handlers — application code implements this for each
@@ -129,7 +129,14 @@ pub struct MethodRegistry {
     /// `package@version/interface/method` string. Versioned and
     /// version-omitted lookups both index into this single map (see
     /// [`MethodRegistry::lookup`] для resolution rules).
-    handlers: HashMap<String, Arc<dyn MethodHandler>>,
+    ///
+    /// Each slot хранит discriminated [`HandlerEntry`] holding either а
+    /// unary [`MethodHandler`] or а [`StreamingMethodHandler`]. Dispatch
+    /// reads the opening opcode off the wire и looks up the appropriate
+    /// variant — а method name registered as one variant cannot also be
+    /// registered as the other (would overwrite silently, matching the
+    /// existing «last registration wins» semantics).
+    handlers: HandlerMap,
 }
 
 impl MethodRegistry {
@@ -139,7 +146,7 @@ impl MethodRegistry {
         Self::default()
     }
 
-    /// Register a handler under its canonical name.
+    /// Register а unary handler under its canonical name.
     ///
     /// # Panics
     ///
@@ -148,6 +155,42 @@ impl MethodRegistry {
     /// resolution at lookup time is unambiguous.
     #[allow(clippy::panic)]
     pub fn register(&mut self, canonical_name: &str, handler: Arc<dyn MethodHandler>) {
+        Self::validate_canonical(canonical_name);
+        self.handlers
+            .insert(canonical_name.to_owned(), HandlerEntry::Unary(handler));
+    }
+
+    /// Register а streaming handler under its canonical name (Phase 3 —
+    /// v0.9.0).
+    ///
+    /// Streaming handlers ride the same `nerw/rpc/1.0.0` substream as
+    /// unary calls but dispatch off [`crate::wire::OPCODE_STREAMING_OPEN_REQUEST`]
+    /// (0x10) on the first byte instead of
+    /// [`crate::wire::OPCODE_UNARY_REQUEST`] (0x00). А method name
+    /// registered as а streaming handler cannot also serve unary calls
+    /// — а second `register*` for the same canonical name silently
+    /// overwrites the first (matches existing «last registration wins»).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `canonical_name` is malformed or lacks `@version` (same
+    /// rules as [`Self::register`]).
+    #[allow(clippy::panic)]
+    pub fn register_streaming(
+        &mut self,
+        canonical_name: &str,
+        handler: Arc<dyn StreamingMethodHandler>,
+    ) {
+        Self::validate_canonical(canonical_name);
+        self.handlers
+            .insert(canonical_name.to_owned(), HandlerEntry::Streaming(handler));
+    }
+
+    /// Shared invariants для both `register*` entry points — keeps the
+    /// «must pin а version» rule in one place so future variants can't
+    /// drift out of sync.
+    #[allow(clippy::panic)]
+    fn validate_canonical(canonical_name: &str) {
         let Some(parsed) = MethodName::parse(canonical_name) else {
             panic!("invalid method name: {canonical_name}");
         };
@@ -155,18 +198,48 @@ impl MethodRegistry {
             parsed.version.is_some(),
             "registered handlers must include version: got {canonical_name}"
         );
-        self.handlers.insert(canonical_name.to_owned(), handler);
     }
 
-    /// Lookup a handler by canonical name.
+    /// Lookup а unary handler by canonical name.
+    ///
+    /// Returns `None` если no slot matches OR если the matching slot
+    /// holds а streaming handler — the caller must look up streaming
+    /// methods via [`Self::lookup_streaming`].
     ///
     /// Supports version-omitted form (`"package/iface/method"`) — resolves
     /// to the largest registered version under the same triple.
     #[must_use]
     pub fn lookup(&self, name: &str) -> Option<Arc<dyn MethodHandler>> {
+        match self.lookup_entry(name)? {
+            HandlerEntry::Unary(h) => Some(Arc::clone(h)),
+            HandlerEntry::Streaming(_) => None,
+        }
+    }
+
+    /// Lookup а streaming handler by canonical name (Phase 3 — v0.9.0).
+    ///
+    /// Returns `None` если no slot matches OR если the matching slot
+    /// holds а unary handler. Supports version-omitted form (same rules
+    /// as [`Self::lookup`]).
+    #[must_use]
+    pub fn lookup_streaming(&self, name: &str) -> Option<Arc<dyn StreamingMethodHandler>> {
+        match self.lookup_entry(name)? {
+            HandlerEntry::Streaming(h) => Some(Arc::clone(h)),
+            HandlerEntry::Unary(_) => None,
+        }
+    }
+
+    /// Lookup ANY handler entry by canonical name (internal helper).
+    ///
+    /// Used by the dispatch layer when it has not yet observed which
+    /// variant the caller is requesting — it picks the entry first then
+    /// reads the opening opcode to decide which interface к invoke.
+    /// Surfaced as `pub(crate)` so [`crate::server`] can avoid duplicating
+    /// the version-resolution logic.
+    pub(crate) fn lookup_entry(&self, name: &str) -> Option<&HandlerEntry> {
         // Exact match first — pinned version case.
         if let Some(h) = self.handlers.get(name) {
-            return Some(Arc::clone(h));
+            return Some(h);
         }
 
         // Try version-omitted resolution.
@@ -178,12 +251,12 @@ impl MethodRegistry {
 
         let prefix = format!("{}@", parsed.package);
         let suffix = format!("/{}/{}", parsed.interface, parsed.method);
-        let max = self
+        let max_key = self
             .handlers
             .keys()
             .filter(|k| k.starts_with(&prefix) && k.ends_with(&suffix))
             .max()?;
-        self.handlers.get(max).map(Arc::clone)
+        self.handlers.get(max_key)
     }
 
     /// `true` if no handlers are registered.
@@ -330,5 +403,64 @@ mod tests {
     fn registry_register_malformed_panics() {
         let mut reg = MethodRegistry::new();
         reg.register("not-a-valid-name", Arc::new(EchoHandler));
+    }
+
+    // -----------------------------------------------------------------
+    // Streaming registry tests (Phase 3 — v0.9.0).
+    // -----------------------------------------------------------------
+
+    struct StreamingNoop;
+
+    #[async_trait]
+    impl crate::streaming::StreamingMethodHandler for StreamingNoop {
+        async fn handle(
+            &self,
+            _ctx: RpcContext,
+            _requests: futures_util::stream::BoxStream<'static, RpcResult<bytes::Bytes>>,
+            _responses: tokio::sync::mpsc::Sender<RpcResult<bytes::Bytes>>,
+        ) -> RpcResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn registry_streaming_exact_lookup() {
+        let mut reg = MethodRegistry::new();
+        reg.register_streaming("nerw:test@1.0.0/echo/loop", Arc::new(StreamingNoop));
+        assert_eq!(reg.len(), 1);
+        assert!(reg.lookup_streaming("nerw:test@1.0.0/echo/loop").is_some());
+        // А streaming handler MUST NOT surface via the unary `lookup` —
+        // dispatch would invoke the wrong interface.
+        assert!(reg.lookup("nerw:test@1.0.0/echo/loop").is_none());
+    }
+
+    #[test]
+    fn registry_unary_lookup_skips_streaming_entry() {
+        let mut reg = MethodRegistry::new();
+        reg.register_streaming("nerw:test@1.0.0/echo/loop", Arc::new(StreamingNoop));
+        // Confirm the opposite direction: streaming entries do not pose
+        // as unary handlers, even with version-omitted resolution.
+        assert!(reg.lookup("nerw:test/echo/loop").is_none());
+        // Streaming resolver finds it via version-omitted form.
+        assert!(reg.lookup_streaming("nerw:test/echo/loop").is_some());
+    }
+
+    #[test]
+    fn registry_unary_and_streaming_coexist_under_distinct_names() {
+        let mut reg = MethodRegistry::new();
+        reg.register("nerw:test@1.0.0/chat/echo", Arc::new(EchoHandler));
+        reg.register_streaming("nerw:test@1.0.0/echo/loop", Arc::new(StreamingNoop));
+        assert_eq!(reg.len(), 2);
+        assert!(reg.lookup("nerw:test@1.0.0/chat/echo").is_some());
+        assert!(reg.lookup_streaming("nerw:test@1.0.0/echo/loop").is_some());
+        assert!(reg.lookup_streaming("nerw:test@1.0.0/chat/echo").is_none());
+        assert!(reg.lookup("nerw:test@1.0.0/echo/loop").is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "registered handlers must include version")]
+    fn registry_register_streaming_without_version_panics() {
+        let mut reg = MethodRegistry::new();
+        reg.register_streaming("nerw:test/echo/loop", Arc::new(StreamingNoop));
     }
 }
